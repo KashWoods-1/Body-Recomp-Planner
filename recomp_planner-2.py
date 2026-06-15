@@ -264,6 +264,10 @@ else:
     st.subheader("🔧 Manual Phase Builder")
     st.caption("Add phases in order. Each phase is a bulk, cut, or maintenance period.")
 
+for p in st.session_state.phases:
+    if "months" in p and "weeks" not in p:
+        p["weeks"] = p.pop("months") * 4
+    
     if "phases" not in st.session_state:
         st.session_state.phases = [
             {"name": "Lean Bulk I",   "type": "bulk",     "weeks": 18},
@@ -290,7 +294,7 @@ else:
             )
         with col3:
             st.session_state.phases[i]["weeks"] = st.number_input(
-                "Weeks", min_value=1, max_value=104, value=phase["weeks"],
+                "Weeks", min_value=1, max_value=104, value=phase.get("weeks", phase.get("months", 8)),
                 key=f"weeks_{i}", label_visibility="collapsed"
             )
         with col4:
