@@ -391,8 +391,9 @@ c1.metric("Final Weight",     f"{final['weight']} lbs", f"{round(final['weight']
 c2.metric("Final BF%",        f"{final['bf']}%",        f"{round(final['bf']-start['bf'],1):+.1f}%")
 c3.metric("Lean Mass Added",  f"+{lean_gained} lbs")
 c4.metric("Peak BF%",         f"{peak_bf_row['bf']}%",  f"Week {peak_bf_row['week']}")
-c5.metric("Total Weeks", f"{total_weeks} wks")
-st.caption(f"{round(total_weeks/4.33, 1)} months")
+with c5:
+    st.metric("Total Weeks", f"{total_weeks} wks")
+    st.caption(f"≈ {round(total_weeks/4.33, 1)} months")
 
 goal_weight_gap = round(final["weight"] - goal_weight, 1)
 goal_bf_gap     = round(final["bf"] - goal_bf, 1)
