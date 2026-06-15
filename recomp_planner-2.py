@@ -263,10 +263,6 @@ if mode == "🤖 Auto Schedule":
 else:
     st.subheader("🔧 Manual Phase Builder")
     st.caption("Add phases in order. Each phase is a bulk, cut, or maintenance period.")
-
-for p in st.session_state.phases:
-    if "months" in p and "weeks" not in p:
-        p["weeks"] = p.pop("months") * 4
     
     if "phases" not in st.session_state:
         st.session_state.phases = [
