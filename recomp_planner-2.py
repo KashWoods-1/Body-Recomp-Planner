@@ -224,6 +224,8 @@ if mode == "🤖 Auto Schedule":
     st.subheader("🤖 Auto-Generated Schedule")
     st.caption("Phases calculated automatically based on your profile and BF guardrails.")
 
+    max_weeks = st.slider("Maximum total weeks", min_value=26, max_value=260, value=156, step=4,
+                      help="52 = 1 year, 104 = 2 years, 156 = 3 years.")
     max_phase_weeks = st.slider("Max weeks per phase", min_value=4, max_value=32, value=20, step=1)
 
     auto_phases, auto_final_weight, auto_final_bf = auto_schedule(
@@ -239,6 +241,7 @@ if mode == "🤖 Auto Schedule":
             "muscle_frac_bulk":  profile["muscle_frac_bulk"],
             "muscle_frac_cut":   profile["muscle_frac_cut"],
         },
+        max_weeks        = max_weeks,
         max_phase_weeks  = max_phase_weeks,
     )
 
