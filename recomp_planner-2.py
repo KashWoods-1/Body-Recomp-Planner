@@ -269,9 +269,9 @@ else:
     st.caption("Add phases in order. Each phase is a bulk, cut, or maintenance period.")
     
     if "phases" not in st.session_state or st.session_state.get("last_auto_phases") != auto_phases:
-    st.session_state.phases = [
-        {"name": p["name"], "type": p["type"], "weeks": p["weeks"]}
-        for p in auto_phases
+        st.session_state.phases = [
+            {"name": p["name"], "type": p["type"], "weeks": p["weeks"]}
+            for p in auto_phases
     ]
     st.session_state.last_auto_phases = auto_phases
 
