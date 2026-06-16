@@ -98,9 +98,10 @@ def auto_schedule(start_weight, start_bf, goal_weight, goal_bf,
     action     = "cut" if current_bf >= bf_ceiling else "bulk"
 
     while week_idx < max_weeks:
-        at_goal_weight = abs(w - goal_weight) <= 0.5
-        at_goal_bf     = abs((fat / w * 100) - goal_bf) <= 0.5
-        if at_goal_weight and at_goal_bf:
+        at_goal_weight = abs(w - goal_weight) <= 1.0
+        at_goal_bf     = abs(current_bf - goal_bf) <= 1.0
+        overshooting   = (action == "cut" and current_bf < goal_bf - 0.3)
+        if (at_goal_weight and at_goal_bf) or overshooting:
             break
 
         current_bf = fat / w * 100
