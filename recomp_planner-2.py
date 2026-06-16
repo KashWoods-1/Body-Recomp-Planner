@@ -220,7 +220,7 @@ with st.sidebar:
     cut_muscle_pct_final  = cut_muscle_pct_override  if cut_muscle_pct_override  > 0 else profile["muscle_frac_cut"]  * 100
     st.divider()
     st.header("⚙️ Auto Schedule Settings")
-    max_weeks = st.slider("Maximum total weeks", min_value=26, max_value=260, value=156, step=4,
+    max_weeks = st.slider("Maximum total weeks", min_value=26, max_value=260, value=156, step=2,
             help="52 = 1 year, 104 = 2 years, 156 = 3 years.")
     max_phase_weeks = st.slider("Max weeks per phase", min_value=4, max_value=32, value=20, step=1)
 
