@@ -219,6 +219,8 @@ with st.sidebar:
     max_weeks = st.slider("Maximum total weeks", min_value=26, max_value=260, value=156, step=4,
             help="52 = 1 year, 104 = 2 years, 156 = 3 years.")
     max_phase_weeks = st.slider("Max weeks per phase", min_value=4, max_value=32, value=20, step=1)
+
+    st.divider()
     st.header("🗓️ Start Date")
     start_date = st.date_input("Start date", value=date(2026, 6, 13))
 
