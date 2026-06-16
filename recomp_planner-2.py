@@ -207,7 +207,7 @@ with st.sidebar:
     st.metric("Muscle % (Cut)",  f"{profile['muscle_frac_cut']*100:.0f}%")
 
     st.divider()
-    sst.header("⚙️ Overrides")
+    st.header("⚙️ Overrides")
     st.caption("Optional — leave at 0 to use calculated values.")
     bulk_rate_override      = st.number_input("Bulk rate (lbs/week)",        min_value=0.0, max_value=2.0,   value=0.0, step=0.05)
     cut_rate_override       = st.number_input("Cut rate (lbs/week)",         min_value=0.0, max_value=2.0,   value=0.0, step=0.05)
