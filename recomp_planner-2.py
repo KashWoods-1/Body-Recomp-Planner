@@ -209,8 +209,8 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ Overrides")
     st.caption("Optional — leave at 0 to use calculated values.")
-    bulk_rate_override      = st.number_input("Bulk rate (lbs/week)",        min_value=0.0, max_value=2.0,   value=0.0, step=0.05)
-    cut_rate_override       = st.number_input("Cut rate (lbs/week)",         min_value=0.0, max_value=2.0,   value=0.0, step=0.05)
+    bulk_rate_override      = st.number_input("Bulk rate (lbs/week) (0 = auto)",        min_value=0.0, max_value=2.0,   value=0.0, step=0.05)
+    cut_rate_override       = st.number_input("Cut rate (lbs/week) (0 = auto)",         min_value=0.0, max_value=2.0,   value=0.0, step=0.05)
     bulk_muscle_pct_override = st.number_input("Muscle % on bulk (0 = auto)", min_value=0,   max_value=100,   value=0,   step=1)
     cut_muscle_pct_override  = st.number_input("Muscle loss % on cut (0 = auto)", min_value=0, max_value=100, value=0,   step=1)
 
