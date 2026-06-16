@@ -220,15 +220,7 @@ with st.sidebar:
     start_date = st.date_input("Start date", value=date(2026, 6, 13))
 
 # ── Phase Builder or Auto Schedule ────────────────────────────────────────────
-if mode == "🤖 Auto Schedule":
-    st.subheader("🤖 Auto-Generated Schedule")
-    st.caption("Phases calculated automatically based on your profile and BF guardrails.")
-
-    max_weeks = st.slider("Maximum total weeks", min_value=26, max_value=260, value=156, step=4,
-                      help="52 = 1 year, 104 = 2 years, 156 = 3 years.")
-    max_phase_weeks = st.slider("Max weeks per phase", min_value=4, max_value=32, value=20, step=1)
-
-    auto_phases, auto_final_weight, auto_final_bf = auto_schedule(
+auto_phases, auto_final_weight, auto_final_bf = auto_schedule(
         start_weight     = start_weight,
         start_bf         = start_bf,
         goal_weight      = goal_weight,
@@ -244,6 +236,14 @@ if mode == "🤖 Auto Schedule":
         max_weeks        = max_weeks,
         max_phase_weeks  = max_phase_weeks,
     )
+
+if mode == "🤖 Auto Schedule":
+    st.subheader("🤖 Auto-Generated Schedule")
+    st.caption("Phases calculated automatically based on your profile and BF guardrails.")
+
+    max_weeks = st.slider("Maximum total weeks", min_value=26, max_value=260, value=156, step=4,
+                      help="52 = 1 year, 104 = 2 years, 156 = 3 years.")
+    max_phase_weeks = st.slider("Max weeks per phase", min_value=4, max_value=32, value=20, step=1)
 
     total_weeks = sum(p["weeks"] for p in auto_phases)
     col1, col2, col3 = st.columns(3)
