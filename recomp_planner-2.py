@@ -268,16 +268,12 @@ else:
     st.subheader("🔧 Manual Phase Builder")
     st.caption("Add phases in order. Each phase is a bulk, cut, or maintenance period.")
     
-    if "phases" not in st.session_state:
-        st.session_state.phases = [
-            {"name": "Lean Bulk I",   "type": "bulk",     "weeks": 18},
-            {"name": "Mini Cut I",    "type": "cut",      "weeks": 8},
-            {"name": "Lean Bulk II",  "type": "bulk",     "weeks": 20},
-            {"name": "Mini Cut II",   "type": "cut",      "weeks": 8},
-            {"name": "Lean Bulk III", "type": "bulk",     "weeks": 20},
-            {"name": "Final Cut",     "type": "cut",      "weeks": 16},
-            {"name": "Maintain",      "type": "maintain", "weeks": 8},
-        ]
+    if "phases" not in st.session_state or st.session_state.get("last_auto_phases") != auto_phases:
+    st.session_state.phases = [
+        {"name": p["name"], "type": p["type"], "weeks": p["weeks"]}
+        for p in auto_phases
+    ]
+    st.session_state.last_auto_phases = auto_phases
 
     phases_to_delete = []
     for i, phase in enumerate(st.session_state.phases):
