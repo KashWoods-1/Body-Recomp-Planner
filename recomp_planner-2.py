@@ -216,6 +216,7 @@ with st.sidebar:
     cut_rate_final  = cut_rate_override  if cut_rate_override  > 0 else profile["cut_rate_weekly"]
 
     st.divider()
+    st.header("⚙️ Auto Schedule Settings")
     max_weeks = st.slider("Maximum total weeks", min_value=26, max_value=260, value=156, step=4,
             help="52 = 1 year, 104 = 2 years, 156 = 3 years.")
     max_phase_weeks = st.slider("Max weeks per phase", min_value=4, max_value=32, value=20, step=1)
