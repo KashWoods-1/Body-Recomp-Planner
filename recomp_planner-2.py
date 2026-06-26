@@ -158,6 +158,11 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
 
     GOAL_TOL = 0.3
 
+    # Track the closest-to-goal schedule seen at any point, so a tight
+    # tolerance can't make us return a bloated runaway plan.
+    best_phases    = []
+    best_distance  = abs(w - goal_weight) + abs(bf_now - goal_bf)
+
     while week_idx < max_weeks:
         bf_now = fat / w * 100
         # stop if at goal
@@ -221,11 +226,18 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
         action = "cut" if action == "bulk" else "bulk"
         week_idx += chosen_len
 
-        # safety: if we're basically at goal weight, allow loop's goal check to end it
+        # Record this schedule if it's the closest to goal we've seen
+        dist_now = abs(w - goal_weight) + abs(fat/w*100 - goal_bf)
+        if dist_now < best_distance:
+            best_distance = dist_now
+            best_phases   = [dict(p) for p in phases]
+
+        # stop once inside tolerance on both targets
         if abs(w - goal_weight) <= GOAL_TOL and abs(fat/w*100 - goal_bf) <= GOAL_TOL:
             break
 
-    return phases
+    # Return the closest schedule found, not necessarily the last one
+    return best_phases if best_phases else phases
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
