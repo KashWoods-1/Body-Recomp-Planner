@@ -156,7 +156,7 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
     bf_now = fat / w * 100
     action = "cut" if bf_now >= bf_ceiling else "bulk"
 
-    GOAL_TOL = 1.0
+    GOAL_TOL = 0.3
 
     while week_idx < max_weeks:
         bf_now = fat / w * 100
@@ -167,12 +167,15 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
         state = (w, lean, fat, peak)
         weeks_left = max_weeks - week_idx
         hi = min(max_phase_weeks, weeks_left)
-        if hi < min_phase_weeks:
+        # Near goal, allow short 1-3 week phases to fine-tune the landing
+        near_goal = abs(w - goal_weight) <= 3 and abs(fat/w*100 - goal_bf) <= 2
+        lo = 1 if near_goal else min_phase_weeks
+        if hi < lo:
             break
 
         # Candidate lengths for THIS phase, bounded by BF guardrails
         best = None  # (score, this_len)
-        for this_len in range(min_phase_weeks, hi + 1):
+        for this_len in range(lo, hi + 1):
             s1 = _roll_phase(state, action, this_len, static, overrides)
             w1, lean1, fat1, peak1 = s1
             bf1 = fat1 / w1 * 100
