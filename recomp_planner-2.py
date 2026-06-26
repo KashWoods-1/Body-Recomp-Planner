@@ -4,508 +4,458 @@ from plotly.subplots import make_subplots
 from datetime import date, timedelta
 import pandas as pd
 
-# ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Recomp Planner",
-    page_icon="💪",
-    layout="wide",
-)
-
+st.set_page_config(page_title="Recomp Planner", page_icon="💪", layout="wide")
 st.title("💪 Body Recomposition Planner")
-st.caption("Model your bulk/cut cycles and see week-by-week projections.")
+st.caption("Dynamic model — rates degrade as you approach your genetic ceiling.")
 
-# ── Profile Calculator ─────────────────────────────────────────────────────────
-def calculate_profile(height_in, weight_lbs, bf_pct, wrist_in, age, training_years):
-    lean_lbs  = weight_lbs * (1 - bf_pct / 100)
-    lean_kg   = lean_lbs * 0.453592
-    height_m  = height_in * 0.0254
-    ffmi      = lean_kg / (height_m ** 2)
-    ffmi_norm = ffmi + 6.1 * (1.8 - height_m)
-
+# ── Static profile: computed once from unchanging inputs ────────────────────────
+def static_profile(height_in, wrist_in, age):
+    height_m = height_in * 0.0254
     if wrist_in < 6.5:
         ffmi_ceiling = 21.5
     elif wrist_in < 7.5:
         ffmi_ceiling = 23.5
     else:
         ffmi_ceiling = 25.0
+    ffmi_ceiling -= max(0, (age - 40) * 0.1)
+    return {"height_m": height_m, "ffmi_ceiling": ffmi_ceiling}
 
-    age_penalty  = max(0, (age - 35) * 0.1)
-    ffmi_ceiling -= age_penalty
+# ── Dynamic profile: recomputed each week from current lean mass ────────────────
+def dynamic_profile(current_lean_lbs, static, peak_lean_lbs=None):
+    height_m     = static["height_m"]
+    ffmi_ceiling = static["ffmi_ceiling"]
     ffmi_floor   = 16.0
-    ceiling_pct  = min(1.0, max(0.0, (ffmi_norm - ffmi_floor) / (ffmi_ceiling - ffmi_floor)))
 
-    if training_years < 1:
-        experience_factor = 1.0
-    elif training_years < 2:
-        experience_factor = 0.8
-    elif training_years < 4:
-        experience_factor = 0.65
-    elif training_years < 7:
-        experience_factor = 0.50
-    else:
-        experience_factor = 0.38
+    lean_for_calc = max(current_lean_lbs, peak_lean_lbs) if peak_lean_lbs else current_lean_lbs
+    lean_kg   = lean_for_calc * 0.453592
+    ffmi      = lean_kg / (height_m ** 2)
+    ffmi_norm = ffmi + 6.1 * (1.8 - height_m)
 
-    combined_factor  = (ceiling_pct * 0.6) + ((1 - experience_factor) * 0.4)
+    prox = min(1.0, max(0.0, (ffmi_norm - ffmi_floor) / (ffmi_ceiling - ffmi_floor)))
 
-    # Convert monthly rates to weekly
-    bulk_rate_monthly = round(1.6 - (combined_factor * 1.1), 2)
-    bulk_rate_monthly = max(0.4, min(2.0, bulk_rate_monthly))
+    EXP, SCALE = 1.2, 2.078
+    remaining = (1 - prox) ** EXP
+
+    bulk_rate_monthly = round(0.3 + remaining * SCALE, 2)
     bulk_rate_weekly  = round(bulk_rate_monthly / 4.33, 3)
 
-    base_muscle_frac = 0.62 - (combined_factor * 0.28)
+    muscle_frac_bulk = round(0.30 + remaining * 0.55, 3)
     rate_penalty     = max(0, (bulk_rate_monthly - 0.75) * 0.08)
-    muscle_frac_bulk = round(max(0.30, base_muscle_frac - rate_penalty), 2)
+    muscle_frac_bulk = round(max(0.30, muscle_frac_bulk - rate_penalty), 3)
 
-    cut_rate_monthly = round(0.75 + (combined_factor * 0.5), 2)
-    cut_rate_monthly = max(0.5, min(1.5, cut_rate_monthly))
+    cut_rate_monthly = round(0.75 + prox * 0.5, 2)
     cut_rate_weekly  = round(cut_rate_monthly / 4.33, 3)
-
-    muscle_frac_cut  = round(0.14 - (experience_factor * 0.06), 2)
-    muscle_frac_cut  = max(0.06, min(0.20, muscle_frac_cut))
+    base_cut_loss    = 0.04 + (cut_rate_weekly ** 1.4) * 0.16
+    muscle_frac_cut  = round(max(0.06, min(0.55, base_cut_loss - prox * 0.03)), 3)
 
     return {
-        "ffmi":              round(ffmi_norm, 1),
-        "ffmi_ceiling":      round(ffmi_ceiling, 1),
-        "ceiling_pct":       round(ceiling_pct * 100, 1),
-        "bulk_rate_weekly":  bulk_rate_weekly,
+        "ffmi": round(ffmi_norm, 2),
+        "ffmi_ceiling": round(ffmi_ceiling, 2),
+        "ceiling_pct": round(prox * 100, 1),
+        "bulk_rate_weekly": bulk_rate_weekly,
         "bulk_rate_monthly": bulk_rate_monthly,
-        "cut_rate_weekly":   cut_rate_weekly,
-        "cut_rate_monthly":  cut_rate_monthly,
-        "muscle_frac_bulk":  muscle_frac_bulk,
-        "muscle_frac_cut":   muscle_frac_cut,
-        "experience_factor": round(experience_factor, 2),
+        "cut_rate_weekly": cut_rate_weekly,
+        "cut_rate_monthly": cut_rate_monthly,
+        "muscle_frac_bulk": muscle_frac_bulk,
+        "muscle_frac_cut": muscle_frac_cut,
     }
 
-# ── Auto Scheduler ─────────────────────────────────────────────────────────────
-def auto_schedule(start_weight, start_bf, goal_weight, goal_bf,
-                  bf_ceiling, bf_floor, profile,
-                  max_weeks=156, max_phase_weeks=20):
+# ── Core weekly step (shared by scheduler and simulation) ───────────────────────
+def step_week(w, lean, fat, peak_lean, action, static,
+              overrides):
+    dp = dynamic_profile(lean, static, peak_lean_lbs=peak_lean)
 
-    bulk_rate        = profile["bulk_rate_weekly"]
-    cut_rate         = profile["cut_rate_weekly"]
-    muscle_frac_bulk = profile["muscle_frac_bulk"]
-    muscle_frac_cut  = profile["muscle_frac_cut"]
+    bulk_rate = overrides["bulk_rate"] if overrides["bulk_rate"] > 0 else dp["bulk_rate_weekly"]
+    cut_rate  = overrides["cut_rate"]  if overrides["cut_rate"]  > 0 else dp["cut_rate_weekly"]
 
+    if overrides["bulk_muscle"] > 0:
+        mfrac_bulk = overrides["bulk_muscle"] / 100
+    else:
+        mfrac_bulk = dp["muscle_frac_bulk"]
+
+    if overrides["cut_muscle"] > 0:
+        mfrac_cut = overrides["cut_muscle"] / 100
+    else:
+        # recompute from actual cut rate so overrides drive lean loss honestly
+        mfrac_cut = max(0.06, min(0.55, 0.04 + (cut_rate ** 1.4) * 0.16 - dp["ceiling_pct"]/100 * 0.03))
+
+    if action == "bulk":
+        lean += bulk_rate * mfrac_bulk
+        fat  += bulk_rate * (1 - mfrac_bulk)
+        w    += bulk_rate
+    elif action == "cut":
+        lean -= cut_rate * mfrac_cut
+        fat  -= cut_rate * (1 - mfrac_cut)
+        w    -= cut_rate
+    else:  # maintain
+        lean += 0.012; fat += 0.012; w += 0.023
+
+    peak_lean = max(peak_lean, lean)
+    return w, lean, fat, peak_lean, bulk_rate, mfrac_bulk, cut_rate, mfrac_cut
+
+# ── Simulation: the single source of truth for all reported numbers ─────────────
+def simulate_dynamic(start_weight, start_bf, phases, static, start_date, overrides):
     w    = start_weight
     lean = start_weight * (1 - start_bf / 100)
     fat  = start_weight * (start_bf / 100)
+    peak_lean = lean
 
-    phases    = []
-    week_idx  = 0
+    rows = [{
+        "week": 0, "date": start_date, "phase": "Start", "phase_type": "start",
+        "weight": round(w,1), "lean": round(lean,1), "fat": round(fat,1),
+        "bf": round(fat/w*100,1), "change": 0.0, "bulk_rate": 0.0, "muscle_frac": 0.0,
+    }]
+
+    idx = 1
+    current_date = start_date
+    for phase in phases:
+        ptype   = phase["type"]
+        n_weeks = phase.get("weeks", 4)
+        for _ in range(n_weeks):
+            prev_w = w
+            w, lean, fat, peak_lean, br, mfb, cr, mfc = step_week(
+                w, lean, fat, peak_lean, ptype, static, overrides)
+            current_date += timedelta(weeks=1)
+            rows.append({
+                "week": idx, "date": current_date,
+                "phase": phase["name"], "phase_type": ptype,
+                "weight": round(w,1), "lean": round(lean,1), "fat": round(fat,1),
+                "bf": round(fat/w*100,1), "change": round(w-prev_w,3),
+                "bulk_rate": round(br,3), "muscle_frac": round(mfb,3),
+            })
+            idx += 1
+    return rows
+
+# ── Dynamic look-ahead scheduler ────────────────────────────────────────────────
+# Bounded 2-phase look-ahead. Min phase = 4 weeks. Uses the same dynamic engine.
+def _roll_phase(state, action, weeks, static, overrides):
+    """Advance a copy of state through `weeks` of `action`. Returns new state."""
+    w, lean, fat, peak = state
+    for _ in range(weeks):
+        w, lean, fat, peak, *_ = step_week(w, lean, fat, peak, action, static, overrides)
+    return (w, lean, fat, peak)
+
+def _goal_distance(state, goal_weight, goal_bf):
+    w, lean, fat, peak = state
+    bf = fat / w * 100
+    # weight and BF errors weighted roughly equally
+    return abs(w - goal_weight) + abs(bf - goal_bf) * 1.0
+
+def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
+                          bf_ceiling, bf_floor, static, overrides,
+                          max_weeks=156, max_phase_weeks=20, min_phase_weeks=4):
+    w    = start_weight
+    lean = start_weight * (1 - start_bf / 100)
+    fat  = start_weight * (start_bf / 100)
+    peak = lean
+
+    phases = []
+    week_idx = 0
     phase_num = 1
 
-    current_bf = fat / w * 100
-    action     = "cut" if current_bf >= bf_ceiling else "bulk"
+    bf_now = fat / w * 100
+    action = "cut" if bf_now >= bf_ceiling else "bulk"
+
+    GOAL_TOL = 1.0
 
     while week_idx < max_weeks:
-        at_goal_weight = abs(w - goal_weight) <= 1.0
-        at_goal_bf     = abs(current_bf - goal_bf) <= 1.0
-        overshooting   = (action == "cut" and current_bf < goal_bf - 0.3)
-        if (at_goal_weight and at_goal_bf) or overshooting:
+        bf_now = fat / w * 100
+        # stop if at goal
+        if abs(w - goal_weight) <= GOAL_TOL and abs(bf_now - goal_bf) <= GOAL_TOL:
             break
 
-        current_bf = fat / w * 100
+        state = (w, lean, fat, peak)
+        weeks_left = max_weeks - week_idx
+        hi = min(max_phase_weeks, weeks_left)
+        if hi < min_phase_weeks:
+            break
 
-        if action == "bulk" and current_bf >= bf_ceiling:
-            action = "cut"
-        elif action == "cut" and current_bf <= bf_floor:
-            action = "bulk"
-        if action == "bulk" and w >= goal_weight + 1.5:
-            action = "cut"
+        # Candidate lengths for THIS phase, bounded by BF guardrails
+        best = None  # (score, this_len)
+        for this_len in range(min_phase_weeks, hi + 1):
+            s1 = _roll_phase(state, action, this_len, static, overrides)
+            w1, lean1, fat1, peak1 = s1
+            bf1 = fat1 / w1 * 100
 
-        phase_weeks = 0
-        phase_name  = f"{'Bulk' if action == 'bulk' else 'Cut'} {phase_num}"
-
-        while week_idx < max_weeks:
-            current_bf    = fat / w * 100
-            should_switch = False
-
-            if action == "bulk" and current_bf >= bf_ceiling:
-                should_switch = True
-            elif action == "cut" and current_bf <= bf_floor:
-                should_switch = True
-            elif action == "bulk" and w >= goal_weight + 1.5:
-                should_switch = True
-            elif phase_weeks >= max_phase_weeks:
-                should_switch = True
-
-            at_goal_weight = abs(w - goal_weight) <= 0.5
-            at_goal_bf     = abs(current_bf - goal_bf) <= 0.5
-            if at_goal_weight and at_goal_bf:
+            # respect guardrails: don't blow past ceiling on bulk / floor on cut
+            if action == "bulk" and bf1 > bf_ceiling + 0.5:
+                break  # longer will only be worse
+            if action == "cut" and bf1 < bf_floor - 0.5:
                 break
 
-            if should_switch and phase_weeks > 0:
-                break
-
-            if action == "bulk":
-                lean += bulk_rate * muscle_frac_bulk
-                fat  += bulk_rate * (1 - muscle_frac_bulk)
-                w    += bulk_rate
+            # 2nd phase look-ahead (opposite action)
+            next_action = "cut" if action == "bulk" else "bulk"
+            weeks_left2 = weeks_left - this_len
+            hi2 = min(max_phase_weeks, weeks_left2)
+            if hi2 >= min_phase_weeks:
+                best2 = None
+                for next_len in range(min_phase_weeks, hi2 + 1):
+                    s2 = _roll_phase(s1, next_action, next_len, static, overrides)
+                    d = _goal_distance(s2, goal_weight, goal_bf)
+                    if best2 is None or d < best2:
+                        best2 = d
+                score = best2 if best2 is not None else _goal_distance(s1, goal_weight, goal_bf)
             else:
-                lean -= cut_rate * muscle_frac_cut
-                fat  -= cut_rate * (1 - muscle_frac_cut)
-                w    -= cut_rate
+                score = _goal_distance(s1, goal_weight, goal_bf)
 
-            phase_weeks += 1
-            week_idx    += 1
+            if best is None or score < best[0]:
+                best = (score, this_len)
 
-        if phase_weeks > 0:
-            phases.append({
-                "name":  phase_name,
-                "type":  action,
-                "weeks": phase_weeks,
-            })
-            if action == "cut":
-                phase_num += 1
-            action = "cut" if action == "bulk" else "bulk"
+        if best is None:
+            break
 
-    return phases, round(w, 1), round(fat / w * 100, 1)
+        chosen_len = best[1]
+        # commit chosen phase
+        new_state = _roll_phase(state, action, chosen_len, static, overrides)
+        w, lean, fat, peak = new_state
+        phases.append({
+            "name": f"{'Bulk' if action=='bulk' else 'Cut'} {phase_num}",
+            "type": action,
+            "weeks": chosen_len,
+        })
+        if action == "cut":
+            phase_num += 1
+        action = "cut" if action == "bulk" else "bulk"
+        week_idx += chosen_len
+
+        # safety: if we're basically at goal weight, allow loop's goal check to end it
+        if abs(w - goal_weight) <= GOAL_TOL and abs(fat/w*100 - goal_bf) <= GOAL_TOL:
+            break
+
+    return phases
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📋 Starting Stats")
-    start_weight   = st.number_input("Start Weight (lbs)", min_value=90.0,  max_value=300.0, value=145.0, step=0.5)
-    start_bf       = st.number_input("Start Body Fat %",   min_value=5.0,   max_value=40.0,  value=15.5,  step=0.5)
+    start_weight = st.number_input("Start Weight (lbs)", 90.0, 300.0, 145.0, 0.5)
+    start_bf     = st.number_input("Start Body Fat %",   5.0, 40.0, 15.5, 0.5)
 
     st.divider()
     st.header("👤 Profile")
-    height_ft      = st.number_input("Height (ft)",         min_value=4,     max_value=7,     value=5)
-    height_in_rem  = st.number_input("Height (in)",         min_value=0,     max_value=11,    value=8)
-    wrist_in       = st.number_input("Wrist circumference (in)", min_value=4.0, max_value=10.0, value=6.25, step=0.25)
-    age            = st.number_input("Age",                 min_value=16,    max_value=80,    value=22)
-    training_years = st.number_input("Years of serious training", min_value=0.0, max_value=30.0, value=3.5, step=0.5)
+    height_ft     = st.number_input("Height (ft)", 4, 7, 5)
+    height_in_rem = st.number_input("Height (in)", 0, 11, 8)
+    wrist_in      = st.number_input("Wrist circumference (in)", 4.0, 10.0, 6.25, 0.25)
+    age           = st.number_input("Age", 16, 80, 22)
 
     st.divider()
     st.header("🎯 Goal")
-    goal_weight    = st.number_input("Goal Weight (lbs)",   min_value=90.0,  max_value=300.0, value=155.0, step=0.5)
-    goal_bf        = st.number_input("Goal Body Fat %",     min_value=5.0,   max_value=40.0,  value=15.0,  step=0.5)
-    bf_ceiling     = st.number_input("Max BF% you'll tolerate (ceiling)", min_value=8.0, max_value=35.0, value=17.0, step=0.5)
-    bf_floor       = st.number_input("Min BF% you'll cut to (floor)",     min_value=4.0, max_value=25.0, value=15.0, step=0.5)
+    goal_weight = st.number_input("Goal Weight (lbs)", 90.0, 300.0, 155.0, 0.5)
+    goal_bf     = st.number_input("Goal Body Fat %",   5.0, 40.0, 15.0, 0.5)
+    bf_ceiling  = st.number_input("Max BF% (ceiling)", 8.0, 35.0, 17.0, 0.5)
+    bf_floor    = st.number_input("Min BF% (floor)",   4.0, 25.0, 15.0, 0.5)
 
     st.divider()
     st.header("⚙️ Mode")
     mode = st.radio("Planning mode", ["🤖 Auto Schedule", "🔧 Manual Phases"])
 
     height_in_total = (height_ft * 12) + height_in_rem
-    profile = calculate_profile(
-        height_in      = height_in_total,
-        weight_lbs     = start_weight,
-        bf_pct         = start_bf,
-        wrist_in       = wrist_in,
-        age            = age,
-        training_years = training_years,
-    )
+    static = static_profile(height_in_total, wrist_in, age)
+
+    # starting-point dynamic profile for the sidebar display
+    start_lean = start_weight * (1 - start_bf / 100)
+    dp_start = dynamic_profile(start_lean, static)
 
     st.divider()
-    st.header("📐 Your Profile")
-    st.metric("FFMI",            f"{profile['ffmi']}")
-    st.metric("FFMI Ceiling",    f"{profile['ffmi_ceiling']}")
-    st.metric("% to Ceiling",    f"{profile['ceiling_pct']}%")
-    st.metric("Rec. Bulk Rate",  f"{profile['bulk_rate_monthly']} lbs/mo  ({profile['bulk_rate_weekly']} lbs/wk)")
-    st.metric("Rec. Cut Rate",   f"{profile['cut_rate_monthly']} lbs/mo  ({profile['cut_rate_weekly']} lbs/wk)")
-    st.metric("Muscle % (Bulk)", f"{profile['muscle_frac_bulk']*100:.0f}%")
-    st.metric("Muscle % (Cut)",  f"{profile['muscle_frac_cut']*100:.0f}%")
+    st.header("📐 Your Profile (starting)")
+    st.caption("These rates degrade over the plan as you approach your ceiling.")
+    st.metric("FFMI", f"{dp_start['ffmi']}")
+    st.metric("FFMI Ceiling", f"{dp_start['ffmi_ceiling']}")
+    st.metric("% to Ceiling", f"{dp_start['ceiling_pct']}%")
+    st.metric("Start Bulk Rate", f"{dp_start['bulk_rate_monthly']} lbs/mo ({dp_start['bulk_rate_weekly']} lbs/wk)")
+    st.metric("Start Cut Rate", f"{dp_start['cut_rate_monthly']} lbs/mo ({dp_start['cut_rate_weekly']} lbs/wk)")
+    st.metric("Start Muscle % (Bulk)", f"{dp_start['muscle_frac_bulk']*100:.0f}%")
 
     st.divider()
     st.header("⚙️ Overrides")
-    st.caption("Optional — leave at 0 to use calculated values.")
-    bulk_rate_override      = st.number_input("Bulk rate (lbs/week)",        min_value=0.0, max_value=2.0,   value=0.0, step=0.05)
-    cut_rate_override       = st.number_input("Cut rate (lbs/week)",         min_value=0.0, max_value=2.0,   value=0.0, step=0.05)
-    bulk_muscle_pct_override = st.number_input("Muscle % on bulk", min_value=0,   max_value=100,   value=0,   step=1)
-    cut_muscle_pct_override  = st.number_input("Muscle loss % on cut", min_value=0, max_value=100, value=0,   step=1)
+    st.caption("Optional — leave at 0 to use dynamic values.")
+    bulk_rate_override   = st.number_input("Bulk rate (lbs/week)", 0.0, 2.0, 0.0, 0.05)
+    cut_rate_override    = st.number_input("Cut rate (lbs/week)",  0.0, 2.0, 0.0, 0.05)
+    bulk_muscle_override = st.number_input("Muscle % on bulk", 0, 100, 0, 1)
+    cut_muscle_override  = st.number_input("Muscle loss % on cut", 0, 100, 0, 1)
 
-    bulk_rate_final      = bulk_rate_override       if bulk_rate_override       > 0 else profile["bulk_rate_weekly"]
-    cut_rate_final       = cut_rate_override        if cut_rate_override        > 0 else profile["cut_rate_weekly"]
-    bulk_muscle_pct_final = bulk_muscle_pct_override if bulk_muscle_pct_override > 0 else profile["muscle_frac_bulk"] * 100
-    cut_muscle_pct_final  = cut_muscle_pct_override  if cut_muscle_pct_override  > 0 else profile["muscle_frac_cut"]  * 100
     st.divider()
     st.header("⚙️ Auto Schedule Settings")
-    max_weeks = st.slider("Maximum total weeks", min_value=26, max_value=260, value=156, step=2,
-            help="52 = 1 year, 104 = 2 years, 156 = 3 years.")
-    max_phase_weeks = st.slider("Max weeks per phase", min_value=4, max_value=32, value=20, step=1)
+    max_weeks = st.slider("Maximum total weeks", 26, 260, 156, 2,
+                          help="52 = 1 yr, 104 = 2 yr, 156 = 3 yr.")
+    max_phase_weeks = st.slider("Max weeks per phase", 4, 32, 20, 1)
 
     st.divider()
     st.header("🗓️ Start Date")
     start_date = st.date_input("Start date", value=date(2026, 6, 13))
 
-# ── Phase Builder or Auto Schedule ────────────────────────────────────────────
-auto_phases, auto_final_weight, auto_final_bf = auto_schedule(
-        start_weight     = start_weight,
-        start_bf         = start_bf,
-        goal_weight      = goal_weight,
-        goal_bf          = goal_bf,
-        bf_ceiling       = bf_ceiling,
-        bf_floor         = bf_floor,
-        profile          = {
-            "bulk_rate_weekly":  bulk_rate_final,
-            "cut_rate_weekly":   cut_rate_final,
-            "muscle_frac_bulk":  bulk_muscle_pct_final / 100,
-            "muscle_frac_cut":   cut_muscle_pct_final / 100,
-        },
-        max_weeks        = max_weeks,
-        max_phase_weeks  = max_phase_weeks,
-    )
+overrides = {
+    "bulk_rate":   bulk_rate_override,
+    "cut_rate":    cut_rate_override,
+    "bulk_muscle": bulk_muscle_override,
+    "cut_muscle":  cut_muscle_override,
+}
 
+# ── Build the schedule (cached so live reruns stay snappy) ───────────────────────
+@st.cache_data(show_spinner="Optimizing schedule…")
+def cached_schedule(sw, sbf, gw, gbf, ceil, floor, static_tuple, ov_tuple, mw, mpw):
+    static_d = {"height_m": static_tuple[0], "ffmi_ceiling": static_tuple[1]}
+    ov = {"bulk_rate": ov_tuple[0], "cut_rate": ov_tuple[1],
+          "bulk_muscle": ov_tuple[2], "cut_muscle": ov_tuple[3]}
+    return auto_schedule_dynamic(sw, sbf, gw, gbf, ceil, floor, static_d, ov,
+                                 max_weeks=mw, max_phase_weeks=mpw)
+
+auto_phases = cached_schedule(
+    start_weight, start_bf, goal_weight, goal_bf, bf_ceiling, bf_floor,
+    (static["height_m"], static["ffmi_ceiling"]),
+    (bulk_rate_override, cut_rate_override, bulk_muscle_override, cut_muscle_override),
+    max_weeks, max_phase_weeks,
+)
+
+# ── Mode UI ──────────────────────────────────────────────────────────────────────
 if mode == "🤖 Auto Schedule":
     st.subheader("🤖 Auto-Generated Schedule")
-    st.caption("Phases calculated automatically based on your profile and BF guardrails.")
-
-    total_weeks = sum(p["weeks"] for p in auto_phases)
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Weeks",    f"{total_weeks}")
-    col2.metric("Est. Final Weight", f"{auto_final_weight} lbs")
-    col3.metric("Est. Final BF",  f"{auto_final_bf}%")
-
-    st.markdown("**Generated phases:**")
-    header_cols = st.columns([3, 2, 1])
-    header_cols[0].markdown("**Phase**")
-    header_cols[1].markdown("**Type**")
-    header_cols[2].markdown("**Weeks**")
-    for p in auto_phases:
-        row_cols = st.columns([3, 2, 1])
-        row_cols[0].write(p["name"])
-        row_cols[1].write(p["type"].capitalize())
-        row_cols[2].write(p["weeks"])
-
+    st.caption("Phases chosen by 2-phase look-ahead using the dynamic engine. "
+               "All numbers below come from the dynamic simulation.")
     active_phases = auto_phases
-
 else:
     st.subheader("🔧 Manual Phase Builder")
-    st.caption("Add phases in order. Each phase is a bulk, cut, or maintenance period.")
-    
-    if "phases" not in st.session_state or st.session_state.get("last_auto_phases") != auto_phases:
-        st.session_state.phases = [
-            {"name": p["name"], "type": p["type"], "weeks": p["weeks"]}
-            for p in auto_phases
-    ]
-    st.session_state.last_auto_phases = auto_phases
+    st.caption("Seeded from the auto schedule when you switch in. Edit freely after.")
+
+    if "phases" not in st.session_state or st.session_state.get("last_auto") != auto_phases:
+        if mode == "🔧 Manual Phases" and st.session_state.get("mode_prev") != mode:
+            st.session_state.phases = [dict(p) for p in auto_phases]
+        elif "phases" not in st.session_state:
+            st.session_state.phases = [dict(p) for p in auto_phases]
+        st.session_state.last_auto = auto_phases
+    st.session_state.mode_prev = mode
 
     phases_to_delete = []
     for i, phase in enumerate(st.session_state.phases):
-        col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
-        with col1:
+        c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
+        with c1:
             st.session_state.phases[i]["name"] = st.text_input(
-                f"Phase {i+1} Name", value=phase["name"], key=f"name_{i}", label_visibility="collapsed"
-            )
-        with col2:
+                f"P{i+1}", value=phase["name"], key=f"name_{i}", label_visibility="collapsed")
+        with c2:
             st.session_state.phases[i]["type"] = st.selectbox(
-                "Type", options=["bulk", "cut", "maintain"],
-                index=["bulk", "cut", "maintain"].index(phase["type"]),
-                key=f"type_{i}", label_visibility="collapsed"
-            )
-        with col3:
+                "Type", ["bulk", "cut", "maintain"],
+                index=["bulk","cut","maintain"].index(phase["type"]),
+                key=f"type_{i}", label_visibility="collapsed")
+        with c3:
             st.session_state.phases[i]["weeks"] = st.number_input(
-                "Weeks", min_value=1, max_value=104, value=phase.get("weeks", phase.get("months", 8)),
-                key=f"weeks_{i}", label_visibility="collapsed"
-            )
-        with col4:
-            if st.button("🗑️", key=f"del_{i}", help="Delete this phase"):
+                "Weeks", 1, 104, value=phase.get("weeks", 8),
+                key=f"weeks_{i}", label_visibility="collapsed")
+        with c4:
+            if st.button("🗑️", key=f"del_{i}"):
                 phases_to_delete.append(i)
-
     for i in sorted(phases_to_delete, reverse=True):
         st.session_state.phases.pop(i)
 
-    col_add, col_reset, _ = st.columns([1, 1, 4])
-    with col_add:
+    ca, cr, _ = st.columns([1, 1, 4])
+    with ca:
         if st.button("➕ Add Phase"):
             st.session_state.phases.append({"name": f"Phase {len(st.session_state.phases)+1}", "type": "bulk", "weeks": 8})
             st.rerun()
-    with col_reset:
-        if st.button("↺ Reset Phases"):
-            del st.session_state.phases
+    with cr:
+        if st.button("↺ Reset to Auto"):
+            st.session_state.phases = [dict(p) for p in auto_phases]
             st.rerun()
 
     active_phases = st.session_state.phases
 
-# ── Simulate ───────────────────────────────────────────────────────────────────
-def simulate(start_weight, start_bf, phases, bulk_rate, bulk_muscle_pct,
-             cut_rate, cut_muscle_pct, start_date):
-    muscle_frac_bulk = bulk_muscle_pct / 100
-    muscle_frac_cut  = cut_muscle_pct  / 100
+# ── Single dynamic simulation feeds everything ──────────────────────────────────
+data = simulate_dynamic(start_weight, start_bf, active_phases, static, start_date, overrides)
 
-    w    = start_weight
-    lean = start_weight * (1 - start_bf / 100)
-    fat  = start_weight * (start_bf / 100)
+final = data[-1]
+start = data[0]
+total_weeks = final["week"]
+lean_gained = round(final["lean"] - start["lean"], 1)
+peak_bf_row = max(data, key=lambda r: r["bf"])
+on_track = abs(final["weight"] - goal_weight) <= 2 and abs(final["bf"] - goal_bf) <= 1.5
 
-    rows = [{
-        "week": 0, "date": start_date, "phase": "Start", "phase_type": "start",
-        "weight": round(w, 1), "lean": round(lean, 1),
-        "fat": round(fat, 1), "bf": round(fat / w * 100, 1), "change": 0.0,
-    }]
-
-    idx          = 1
-    current_date = start_date
-    for phase in phases:
-        ptype   = phase["type"]
-        n_weeks = phase.get("weeks", phase.get("months", 4))
-        for _ in range(n_weeks):
-            prev_w = w
-            if ptype == "bulk":
-                lean += bulk_rate * muscle_frac_bulk
-                fat  += bulk_rate * (1 - muscle_frac_bulk)
-                w    += bulk_rate
-            elif ptype == "cut":
-                lean -= cut_rate * muscle_frac_cut
-                fat  -= cut_rate * (1 - muscle_frac_cut)
-                w    -= cut_rate
-            else:
-                lean += 0.012
-                fat  += 0.012
-                w    += 0.023
-
-            current_date = current_date + timedelta(weeks=1)
-            rows.append({
-                "week":       idx,
-                "date":       current_date,
-                "phase":      phase["name"],
-                "phase_type": ptype,
-                "weight":     round(w, 1),
-                "lean":       round(lean, 1),
-                "fat":        round(fat, 1),
-                "bf":         round(fat / w * 100, 1),
-                "change":     round(w - prev_w, 3),
-            })
-            idx += 1
-
-    return rows
-
-data = simulate(
-    start_weight,
-    start_bf,
-    active_phases,
-    bulk_rate_final,
-    bulk_muscle_pct_final,
-    cut_rate_final,
-    cut_muscle_pct_final,
-    start_date,
-)
-
-# ── Summary Stats ──────────────────────────────────────────────────────────────
-final        = data[-1]
-start        = data[0]
-total_weeks  = final["week"]
-lean_gained  = round(final["lean"] - start["lean"], 1)
-peak_bf_row  = max(data, key=lambda r: r["bf"])
-on_track     = abs(final["weight"] - goal_weight) <= 2 and abs(final["bf"] - goal_bf) <= 1.5
+# Auto-schedule summary (now pulled from the dynamic sim — single source of truth)
+if mode == "🤖 Auto Schedule":
+    cA, cB, cC = st.columns(3)
+    cA.metric("Total Weeks", f"{total_weeks}")
+    cB.metric("Final Weight (dynamic)", f"{final['weight']} lbs")
+    cC.metric("Final BF (dynamic)", f"{final['bf']}%")
+    st.markdown("**Phases:**")
+    h = st.columns([3, 2, 1]); h[0].markdown("**Phase**"); h[1].markdown("**Type**"); h[2].markdown("**Weeks**")
+    for p in auto_phases:
+        r = st.columns([3, 2, 1]); r[0].write(p["name"]); r[1].write(p["type"].capitalize()); r[2].write(p["weeks"])
 
 st.divider()
 st.subheader("📊 Projection Summary")
-
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Final Weight",     f"{final['weight']} lbs", f"{round(final['weight']-start['weight'],1):+.1f} lbs")
-c2.metric("Final BF%",        f"{final['bf']}%",        f"{round(final['bf']-start['bf'],1):+.1f}%")
-c3.metric("Lean Mass Added",  f"+{lean_gained} lbs")
-c4.metric("Peak BF%",         f"{peak_bf_row['bf']}%",  f"Week {peak_bf_row['week']}")
+c1.metric("Final Weight", f"{final['weight']} lbs", f"{round(final['weight']-start['weight'],1):+.1f} lbs")
+c2.metric("Final BF%", f"{final['bf']}%", f"{round(final['bf']-start['bf'],1):+.1f}%", delta_color="inverse")
+c3.metric("Lean Mass Added", f"+{lean_gained} lbs")
+c4.metric("Peak BF%", f"{peak_bf_row['bf']}%", f"Week {peak_bf_row['week']}")
 with c5:
     st.metric("Total Weeks", f"{total_weeks} wks")
     st.caption(f"≈ {round(total_weeks/4.33, 1)} months")
 
-goal_weight_gap = round(final["weight"] - goal_weight, 1)
-goal_bf_gap     = round(final["bf"] - goal_bf, 1)
+gw_gap = round(final["weight"] - goal_weight, 1)
+gbf_gap = round(final["bf"] - goal_bf, 1)
 if on_track:
     st.success(f"✅ On track — projected finish: {final['weight']} lbs @ {final['bf']}% BF")
 else:
-    st.warning(
-        f"⚠️ Misses goal by **{goal_weight_gap:+.1f} lbs** and **{goal_bf_gap:+.1f}% BF**. "
-        f"Adjust phases or rates."
-    )
+    st.warning(f"⚠️ Closest the model reaches: {final['weight']} lbs @ {final['bf']}% BF "
+               f"(off by {gw_gap:+.1f} lbs, {gbf_gap:+.1f}% BF). "
+               f"This is the honest limit given your rates — extend max weeks or adjust goal.")
 
-# ── Charts ─────────────────────────────────────────────────────────────────────
+# ── Charts ──────────────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("📈 Charts")
-
 COLORS = {"bulk": "#10b981", "cut": "#ef4444", "maintain": "#f59e0b", "start": "#6366f1"}
+dates   = [r["date"] for r in data]
+weights = [r["weight"] for r in data]
+leans   = [r["lean"] for r in data]
+bfs     = [r["bf"] for r in data]
+plist   = [r["phase"] for r in data]
 
-dates       = [r["date"]   for r in data]
-weights     = [r["weight"] for r in data]
-leans       = [r["lean"]   for r in data]
-bfs         = [r["bf"]     for r in data]
-phases_list = [r["phase"]  for r in data]
-
-fig = make_subplots(
-    rows=2, cols=1,
+fig = make_subplots(rows=2, cols=1,
     subplot_titles=("Scale Weight & Lean Mass (lbs)", "Body Fat %"),
-    vertical_spacing=0.12,
-    row_heights=[0.6, 0.4],
-)
+    vertical_spacing=0.12, row_heights=[0.6, 0.4])
 
-fig.add_trace(go.Scatter(
-    x=dates, y=weights, mode="lines+markers",
-    name="Scale Weight",
-    line=dict(color="#10b981", width=2.5),
-    marker=dict(size=3),
-    hovertemplate="<b>%{text}</b><br>Weight: %{y} lbs<extra></extra>",
-    text=phases_list,
-), row=1, col=1)
-
-fig.add_trace(go.Scatter(
-    x=dates, y=leans, mode="lines",
-    name="Lean Mass",
+fig.add_trace(go.Scatter(x=dates, y=weights, mode="lines+markers", name="Scale Weight",
+    line=dict(color="#10b981", width=2.5), marker=dict(size=3),
+    hovertemplate="<b>%{text}</b><br>Weight: %{y} lbs<extra></extra>", text=plist), row=1, col=1)
+fig.add_trace(go.Scatter(x=dates, y=leans, mode="lines", name="Lean Mass",
     line=dict(color="#6366f1", width=1.8, dash="dot"),
-    hovertemplate="<b>%{text}</b><br>Lean: %{y} lbs<extra></extra>",
-    text=phases_list,
-), row=1, col=1)
-
+    hovertemplate="<b>%{text}</b><br>Lean: %{y} lbs<extra></extra>", text=plist), row=1, col=1)
 fig.add_hline(y=goal_weight, line_dash="dash", line_color="rgba(255,255,255,0.27)",
-              annotation_text=f"Goal: {goal_weight} lbs", row=1, col=1)
-
-fig.add_trace(go.Scatter(
-    x=dates, y=bfs, mode="lines+markers",
-    name="Body Fat %",
-    line=dict(color="#f59e0b", width=2.5),
-    marker=dict(size=3),
-    hovertemplate="<b>%{text}</b><br>BF: %{y}%<extra></extra>",
-    text=phases_list,
-), row=2, col=1)
-
+    annotation_text=f"Goal: {goal_weight} lbs", row=1, col=1)
+fig.add_trace(go.Scatter(x=dates, y=bfs, mode="lines+markers", name="Body Fat %",
+    line=dict(color="#f59e0b", width=2.5), marker=dict(size=3),
+    hovertemplate="<b>%{text}</b><br>BF: %{y}%<extra></extra>", text=plist), row=2, col=1)
 fig.add_hline(y=goal_bf, line_dash="dash", line_color="rgba(255,255,255,0.27)",
-              annotation_text=f"Goal: {goal_bf}%", row=2, col=1)
-
+    annotation_text=f"Goal: {goal_bf}%", row=2, col=1)
 fig.add_hline(y=bf_ceiling, line_dash="dot", line_color="rgba(239,68,68,0.4)",
-              annotation_text=f"BF Ceiling: {bf_ceiling}%", row=2, col=1)
-
+    annotation_text=f"Ceiling: {bf_ceiling}%", row=2, col=1)
 fig.add_hline(y=bf_floor, line_dash="dot", line_color="rgba(16,185,129,0.4)",
-              annotation_text=f"BF Floor: {bf_floor}%", row=2, col=1)
+    annotation_text=f"Floor: {bf_floor}%", row=2, col=1)
 
 phase_starts = {}
 for r in data:
     if r["phase"] not in phase_starts:
         phase_starts[r["phase"]] = (r["date"], r["phase_type"])
-
-phase_names = list(phase_starts.keys())
-for idx_p, pname in enumerate(phase_names):
-    pdate, ptype = phase_starts[pname]
-    end_date = phase_starts[phase_names[idx_p+1]][0] if idx_p+1 < len(phase_names) else dates[-1]
-    color = COLORS.get(ptype, "#888888")
+pnames = list(phase_starts.keys())
+for i, pn in enumerate(pnames):
+    pdate, ptype = phase_starts[pn]
+    end = phase_starts[pnames[i+1]][0] if i+1 < len(pnames) else dates[-1]
     for row in [1, 2]:
-        fig.add_vrect(
-            x0=pdate, x1=end_date,
-            fillcolor=color, opacity=0.07, line_width=0,
-            row=row, col=1,
-        )
+        fig.add_vrect(x0=pdate, x1=end, fillcolor=COLORS.get(ptype, "#888"), opacity=0.07, line_width=0, row=row, col=1)
 
-fig.update_layout(
-    height=600,
-    paper_bgcolor="#0f1624",
-    plot_bgcolor="#080b14",
+fig.update_layout(height=600, paper_bgcolor="#0f1624", plot_bgcolor="#080b14",
     font=dict(color="#e2e8f0"),
     legend=dict(bgcolor="#0f1624", bordercolor="#1e293b", borderwidth=1),
-    hovermode="x unified",
-    margin=dict(l=10, r=10, t=40, b=10),
-)
+    hovermode="x unified", margin=dict(l=10, r=10, t=40, b=10))
 fig.update_xaxes(gridcolor="#1e293b", showgrid=True)
 fig.update_yaxes(gridcolor="#1e293b", showgrid=True)
-
 st.plotly_chart(fig, use_container_width=True)
 
-# ── Week Table ─────────────────────────────────────────────────────────────────
+# ── Table ────────────────────────────────────────────────────────────────────────
 st.divider()
 st.subheader("📅 Week-by-Week Breakdown")
-
 with st.expander("Show full table", expanded=False):
     df = pd.DataFrame(data)
-    df["date"]   = df["date"].astype(str)
+    df["date"] = df["date"].astype(str)
     df["change"] = df["change"].apply(lambda x: f"+{x:.2f}" if x > 0 else (f"{x:.2f}" if x != 0 else "—"))
-    df.columns   = ["Week", "Date", "Phase", "Type", "Weight (lbs)", "Lean (lbs)", "Fat (lbs)", "BF%", "Δ Weight"]
-    df = df.drop(columns=["Type"])
+    df = df[["week","date","phase","weight","lean","fat","bf","change","bulk_rate"]]
+    df.columns = ["Week","Date","Phase","Weight","Lean","Fat","BF%","ΔWt","BulkRate/wk"]
     st.dataframe(df, use_container_width=True, hide_index=True)
