@@ -3,54 +3,111 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import date, timedelta
 import pandas as pd
+import math
 
 st.set_page_config(page_title="Recomp Planner", page_icon="💪", layout="wide")
 st.title("💪 Body Recomposition Planner")
-st.caption("Dynamic model — rates degrade as you approach your genetic ceiling.")
+st.caption("Dynamic model — personalized ceiling from frame, rates degrade as you approach it.")
 
-# ── Static profile: computed once from unchanging inputs ────────────────────────
-def static_profile(height_in, wrist_in, age):
-    height_m = height_in * 0.0254
-    if wrist_in < 6.5:
-        ffmi_ceiling = 21.5
-    elif wrist_in < 7.5:
-        ffmi_ceiling = 23.5
-    else:
-        ffmi_ceiling = 25.0
-    ffmi_ceiling -= max(0, (age - 40) * 0.1)
-    return {"height_m": height_m, "ffmi_ceiling": ffmi_ceiling}
+# ══════════════════════════════════════════════════════════════════════════════
+# FRAME ENGINE (Casey Butt ceiling + frame-scaled baseline)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Dynamic profile: recomputed each week from current lean mass ────────────────
-def dynamic_profile(current_lean_lbs, static, peak_lean_lbs=None):
-    height_m     = static["height_m"]
-    ffmi_ceiling = static["ffmi_ceiling"]
-    ffmi_floor   = 16.0
+# Default fraction of the Butt ceiling that an untrained person of the same frame
+# sits at. Calibrated so an average frame lands ~FFMI 17 untrained. Because it is
+# a fraction of the (frame-derived) ceiling, the baseline scales with frame too.
+DEFAULT_BASELINE_K = 0.651
+
+# How hard we pull a user's remembered starting stats toward the frame default.
+# 0 = trust their memory fully, 1 = ignore it. Heavy default because starting BF
+# from years ago is the least reliable input in the whole model.
+STARTING_STATS_SMOOTHING = 0.6
+
+def casey_butt_ceiling_lean(height_in, wrist_in, ankle_in, bf=10):
+    """Max drug-free lean body mass. Verified vs Butt's worked example
+    (69in, 7.0, 8.7, 10%bf -> 173.7 lbs)."""
+    return (height_in ** 1.5) * (
+        math.sqrt(wrist_in) / 22.6670 + math.sqrt(ankle_in) / 17.0104
+    ) * (1 + bf / 224.0)
+
+def _height_m(height_in):
+    return height_in * 0.0254
+
+def lean_to_norm_ffmi(lean_lbs, height_in):
+    hm = _height_m(height_in)
+    return (lean_lbs * 0.453592) / (hm ** 2) + 6.1 * (1.8 - hm)
+
+def build_frame(height_in, wrist_in, ankle_in, age,
+                start_lean=None, start_lean_weight=None):
+    """Compute the personalized ceiling + baseline once.
+
+    ceiling_lean : Casey Butt max lean (age-adjusted)
+    baseline_lean: untrained floor, frame-scaled. Default = K * ceiling.
+                   If the user supplies real starting stats, blend their implied
+                   untrained lean toward that default (heavy smoothing + clamp).
+    """
+    ceiling = casey_butt_ceiling_lean(height_in, wrist_in, ankle_in, bf=10)
+    ceiling *= 1 - max(0, (age - 40) * 0.005)   # mild age tax on the ceiling
+
+    default_baseline = DEFAULT_BASELINE_K * ceiling
+
+    baseline = default_baseline
+    if start_lean_weight is not None and start_lean is not None and start_lean > 0:
+        # user's remembered untrained lean, blended toward the frame default
+        blended = (STARTING_STATS_SMOOTHING * default_baseline
+                   + (1 - STARTING_STATS_SMOOTHING) * start_lean)
+        # clamp so an absurd memory can't escape a sane band around the default
+        lo = 0.55 * ceiling
+        hi = 0.72 * ceiling
+        baseline = max(lo, min(hi, blended))
+
+    return {
+        "height_in": height_in,
+        "ceiling_lean": ceiling,
+        "baseline_lean": baseline,
+        "ffmi_ceiling": lean_to_norm_ffmi(ceiling, height_in),
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DYNAMIC PROFILE (rates as a function of proximity to the personalized ceiling)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Decay curve calibrated to the empirical Lyle/Butt schedule
+# (year1 +20, year2 +10, year3 +5, year4 +2.5 lbs lean from untrained).
+CURVE_MAXRATE_YR = 20.2   # lbs/yr at zero proximity
+CURVE_K          = 1.8    # decay exponent
+
+def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None):
+    ceiling  = frame["ceiling_lean"]
+    baseline = frame["baseline_lean"]
+    height_in = frame["height_in"]
 
     lean_for_calc = max(current_lean_lbs, peak_lean_lbs) if peak_lean_lbs else current_lean_lbs
-    lean_kg   = lean_for_calc * 0.453592
-    ffmi      = lean_kg / (height_m ** 2)
-    ffmi_norm = ffmi + 6.1 * (1.8 - height_m)
 
-    prox = min(1.0, max(0.0, (ffmi_norm - ffmi_floor) / (ffmi_ceiling - ffmi_floor)))
+    rng = max(1e-6, ceiling - baseline)
+    prox = min(1.0, max(0.0, (lean_for_calc - baseline) / rng))
 
-    EXP, SCALE = 1.2, 2.078
-    remaining = (1 - prox) ** EXP
+    # Muscle fraction first — needed to convert lean gain to scale weight
+    muscle_frac_bulk = round(0.30 + (1 - prox) ** 1.2 * 0.32, 3)
+    muscle_frac_bulk = max(0.30, min(0.60, muscle_frac_bulk))
 
-    bulk_rate_monthly = round(0.3 + remaining * SCALE, 2)
-    bulk_rate_weekly  = round(bulk_rate_monthly / 4.33, 3)
+    # Curve gives LEAN gain per year (calibrated to the 20/10/5/2 lean schedule).
+    # Scale-weight bulk rate = lean rate / muscle fraction, since fat rides along.
+    lean_rate_yr      = CURVE_MAXRATE_YR * (1 - prox) ** CURVE_K
+    bulk_rate_yr      = lean_rate_yr / muscle_frac_bulk
+    bulk_rate_weekly  = round(bulk_rate_yr / 52.0, 3)
+    bulk_rate_monthly = round(bulk_rate_yr / 12.0, 2)
 
-    muscle_frac_bulk = round(0.30 + remaining * 0.55, 3)
-    rate_penalty     = max(0, (bulk_rate_monthly - 0.75) * 0.08)
-    muscle_frac_bulk = round(max(0.30, muscle_frac_bulk - rate_penalty), 3)
-
+    # Cut side: rate rises slightly with proximity; lean-loss fraction scales
+    # with cut aggressiveness (set later from the actual cut rate in use).
     cut_rate_monthly = round(0.75 + prox * 0.5, 2)
     cut_rate_weekly  = round(cut_rate_monthly / 4.33, 3)
     base_cut_loss    = 0.04 + (cut_rate_weekly ** 1.4) * 0.16
     muscle_frac_cut  = round(max(0.06, min(0.55, base_cut_loss - prox * 0.03)), 3)
 
     return {
-        "ffmi": round(ffmi_norm, 2),
-        "ffmi_ceiling": round(ffmi_ceiling, 2),
+        "ffmi": round(lean_to_norm_ffmi(lean_for_calc, height_in), 2),
+        "ffmi_ceiling": round(frame["ffmi_ceiling"], 2),
         "ceiling_pct": round(prox * 100, 1),
         "bulk_rate_weekly": bulk_rate_weekly,
         "bulk_rate_monthly": bulk_rate_monthly,
@@ -60,10 +117,11 @@ def dynamic_profile(current_lean_lbs, static, peak_lean_lbs=None):
         "muscle_frac_cut": muscle_frac_cut,
     }
 
-# ── Core weekly step (shared by scheduler and simulation) ───────────────────────
-def step_week(w, lean, fat, peak_lean, action, static,
-              overrides):
-    dp = dynamic_profile(lean, static, peak_lean_lbs=peak_lean)
+# ══════════════════════════════════════════════════════════════════════════════
+# WEEKLY STEP (shared by scheduler + simulation)
+# ══════════════════════════════════════════════════════════════════════════════
+def step_week(w, lean, fat, peak_lean, action, frame, overrides):
+    dp = dynamic_profile(lean, frame, peak_lean_lbs=peak_lean)
 
     bulk_rate = overrides["bulk_rate"] if overrides["bulk_rate"] > 0 else dp["bulk_rate_weekly"]
     cut_rate  = overrides["cut_rate"]  if overrides["cut_rate"]  > 0 else dp["cut_rate_weekly"]
@@ -76,8 +134,8 @@ def step_week(w, lean, fat, peak_lean, action, static,
     if overrides["cut_muscle"] > 0:
         mfrac_cut = overrides["cut_muscle"] / 100
     else:
-        # recompute from actual cut rate so overrides drive lean loss honestly
-        mfrac_cut = max(0.06, min(0.55, 0.04 + (cut_rate ** 1.4) * 0.16 - dp["ceiling_pct"]/100 * 0.03))
+        mfrac_cut = max(0.06, min(0.55,
+            0.04 + (cut_rate ** 1.4) * 0.16 - dp["ceiling_pct"] / 100 * 0.03))
 
     if action == "bulk":
         lean += bulk_rate * mfrac_bulk
@@ -87,14 +145,16 @@ def step_week(w, lean, fat, peak_lean, action, static,
         lean -= cut_rate * mfrac_cut
         fat  -= cut_rate * (1 - mfrac_cut)
         w    -= cut_rate
-    else:  # maintain
+    else:
         lean += 0.012; fat += 0.012; w += 0.023
 
     peak_lean = max(peak_lean, lean)
     return w, lean, fat, peak_lean, bulk_rate, mfrac_bulk, cut_rate, mfrac_cut
 
-# ── Simulation: the single source of truth for all reported numbers ─────────────
-def simulate_dynamic(start_weight, start_bf, phases, static, start_date, overrides):
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMULATION (single source of truth)
+# ══════════════════════════════════════════════════════════════════════════════
+def simulate_dynamic(start_weight, start_bf, phases, frame, start_date, overrides):
     w    = start_weight
     lean = start_weight * (1 - start_bf / 100)
     fat  = start_weight * (start_bf / 100)
@@ -114,7 +174,7 @@ def simulate_dynamic(start_weight, start_bf, phases, static, start_date, overrid
         for _ in range(n_weeks):
             prev_w = w
             w, lean, fat, peak_lean, br, mfb, cr, mfc = step_week(
-                w, lean, fat, peak_lean, ptype, static, overrides)
+                w, lean, fat, peak_lean, ptype, frame, overrides)
             current_date += timedelta(weeks=1)
             rows.append({
                 "week": idx, "date": current_date,
@@ -126,23 +186,22 @@ def simulate_dynamic(start_weight, start_bf, phases, static, start_date, overrid
             idx += 1
     return rows
 
-# ── Dynamic look-ahead scheduler ────────────────────────────────────────────────
-# Bounded 2-phase look-ahead. Min phase = 4 weeks. Uses the same dynamic engine.
-def _roll_phase(state, action, weeks, static, overrides):
-    """Advance a copy of state through `weeks` of `action`. Returns new state."""
+# ══════════════════════════════════════════════════════════════════════════════
+# DYNAMIC LOOK-AHEAD SCHEDULER
+# ══════════════════════════════════════════════════════════════════════════════
+def _roll_phase(state, action, weeks, frame, overrides):
     w, lean, fat, peak = state
     for _ in range(weeks):
-        w, lean, fat, peak, *_ = step_week(w, lean, fat, peak, action, static, overrides)
+        w, lean, fat, peak, *_ = step_week(w, lean, fat, peak, action, frame, overrides)
     return (w, lean, fat, peak)
 
 def _goal_distance(state, goal_weight, goal_bf):
     w, lean, fat, peak = state
     bf = fat / w * 100
-    # weight and BF errors weighted roughly equally
-    return abs(w - goal_weight) + abs(bf - goal_bf) * 1.0
+    return abs(w - goal_weight) + abs(bf - goal_bf)
 
 def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
-                          bf_ceiling, bf_floor, static, overrides,
+                          bf_ceiling, bf_floor, frame, overrides,
                           max_weeks=156, max_phase_weeks=20, min_phase_weeks=4):
     w    = start_weight
     lean = start_weight * (1 - start_bf / 100)
@@ -152,53 +211,43 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
     phases = []
     week_idx = 0
     phase_num = 1
-
     bf_now = fat / w * 100
     action = "cut" if bf_now >= bf_ceiling else "bulk"
-
     GOAL_TOL = 0.3
 
-    # Track the closest-to-goal schedule seen at any point, so a tight
-    # tolerance can't make us return a bloated runaway plan.
-    best_phases    = []
-    best_distance  = abs(w - goal_weight) + abs(bf_now - goal_bf)
+    best_phases   = []
+    best_distance = abs(w - goal_weight) + abs(bf_now - goal_bf)
 
     while week_idx < max_weeks:
         bf_now = fat / w * 100
-        # stop if at goal
         if abs(w - goal_weight) <= GOAL_TOL and abs(bf_now - goal_bf) <= GOAL_TOL:
             break
 
         state = (w, lean, fat, peak)
         weeks_left = max_weeks - week_idx
         hi = min(max_phase_weeks, weeks_left)
-        # Near goal, allow short 1-3 week phases to fine-tune the landing
         near_goal = abs(w - goal_weight) <= 3 and abs(fat/w*100 - goal_bf) <= 2
         lo = 1 if near_goal else min_phase_weeks
         if hi < lo:
             break
 
-        # Candidate lengths for THIS phase, bounded by BF guardrails
-        best = None  # (score, this_len)
+        best = None
         for this_len in range(lo, hi + 1):
-            s1 = _roll_phase(state, action, this_len, static, overrides)
+            s1 = _roll_phase(state, action, this_len, frame, overrides)
             w1, lean1, fat1, peak1 = s1
             bf1 = fat1 / w1 * 100
-
-            # respect guardrails: don't blow past ceiling on bulk / floor on cut
             if action == "bulk" and bf1 > bf_ceiling + 0.5:
-                break  # longer will only be worse
+                break
             if action == "cut" and bf1 < bf_floor - 0.5:
                 break
 
-            # 2nd phase look-ahead (opposite action)
             next_action = "cut" if action == "bulk" else "bulk"
             weeks_left2 = weeks_left - this_len
             hi2 = min(max_phase_weeks, weeks_left2)
             if hi2 >= min_phase_weeks:
                 best2 = None
                 for next_len in range(min_phase_weeks, hi2 + 1):
-                    s2 = _roll_phase(s1, next_action, next_len, static, overrides)
+                    s2 = _roll_phase(s1, next_action, next_len, frame, overrides)
                     d = _goal_distance(s2, goal_weight, goal_bf)
                     if best2 is None or d < best2:
                         best2 = d
@@ -213,33 +262,30 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
             break
 
         chosen_len = best[1]
-        # commit chosen phase
-        new_state = _roll_phase(state, action, chosen_len, static, overrides)
+        new_state = _roll_phase(state, action, chosen_len, frame, overrides)
         w, lean, fat, peak = new_state
         phases.append({
             "name": f"{'Bulk' if action=='bulk' else 'Cut'} {phase_num}",
-            "type": action,
-            "weeks": chosen_len,
+            "type": action, "weeks": chosen_len,
         })
         if action == "cut":
             phase_num += 1
         action = "cut" if action == "bulk" else "bulk"
         week_idx += chosen_len
 
-        # Record this schedule if it's the closest to goal we've seen
         dist_now = abs(w - goal_weight) + abs(fat/w*100 - goal_bf)
         if dist_now < best_distance:
             best_distance = dist_now
             best_phases   = [dict(p) for p in phases]
 
-        # stop once inside tolerance on both targets
         if abs(w - goal_weight) <= GOAL_TOL and abs(fat/w*100 - goal_bf) <= GOAL_TOL:
             break
 
-    # Return the closest schedule found, not necessarily the last one
     return best_phases if best_phases else phases
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.header("📋 Starting Stats")
     start_weight = st.number_input("Start Weight (lbs)", 90.0, 300.0, 145.0, 0.5)
@@ -250,7 +296,17 @@ with st.sidebar:
     height_ft     = st.number_input("Height (ft)", 4, 7, 5)
     height_in_rem = st.number_input("Height (in)", 0, 11, 8)
     wrist_in      = st.number_input("Wrist circumference (in)", 4.0, 10.0, 6.25, 0.25)
+    ankle_in      = st.number_input("Ankle circumference (in)", 6.0, 14.0, 8.0, 0.25)
     age           = st.number_input("Age", 16, 80, 22)
+
+    # ── optional: starting-lifting stats (collapsed) ───────────────────────────
+    with st.expander("📦 Starting-lifting stats (optional)", expanded=False):
+        st.caption("Roughly what you weighed and your BF% when you FIRST started "
+                   "lifting. Used to personalize your untrained baseline. Heavily "
+                   "smoothed toward the frame default, since old-memory BF is noisy. "
+                   "Leave at 0 to use the frame default.")
+        first_weight = st.number_input("Starting weight when you began (lbs)", 0.0, 300.0, 0.0, 1.0)
+        first_bf     = st.number_input("Starting BF% when you began", 0.0, 40.0, 0.0, 0.5)
 
     st.divider()
     st.header("🎯 Goal")
@@ -263,40 +319,49 @@ with st.sidebar:
     st.header("⚙️ Mode")
     mode = st.radio("Planning mode", ["🤖 Auto Schedule", "🔧 Manual Phases"])
 
+    # ── build the frame (ceiling + baseline) ───────────────────────────────────
     height_in_total = (height_ft * 12) + height_in_rem
-    static = static_profile(height_in_total, wrist_in, age)
+    start_lean_from_first = None
+    if first_weight > 0 and first_bf > 0:
+        start_lean_from_first = first_weight * (1 - first_bf / 100)
 
-    # starting-point dynamic profile for the sidebar display
+    frame = build_frame(height_in_total, wrist_in, ankle_in, age,
+                        start_lean=start_lean_from_first,
+                        start_lean_weight=first_weight if first_weight > 0 else None)
+
     start_lean = start_weight * (1 - start_bf / 100)
-    dp_start = dynamic_profile(start_lean, static)
+    dp_start = dynamic_profile(start_lean, frame)
 
     st.divider()
     st.header("📐 Your Profile (starting)")
-    st.caption("These rates degrade over the plan as you approach your ceiling.")
+    st.caption("Rates degrade over the plan as you approach your ceiling.")
     st.metric("FFMI", f"{dp_start['ffmi']}")
-    st.metric("FFMI Ceiling", f"{dp_start['ffmi_ceiling']}")
+    st.metric("Ceiling (lean lbs)", f"{frame['ceiling_lean']:.0f}",
+              help=f"Casey Butt max, normalized FFMI {frame['ffmi_ceiling']:.1f}")
+    st.metric("Baseline (untrained lbs)", f"{frame['baseline_lean']:.0f}")
     st.metric("% to Ceiling", f"{dp_start['ceiling_pct']}%")
-    st.metric("Start Bulk Rate", f"{dp_start['bulk_rate_monthly']} lbs/mo ({dp_start['bulk_rate_weekly']} lbs/wk)")
-    st.metric("Start Cut Rate", f"{dp_start['cut_rate_monthly']} lbs/mo ({dp_start['cut_rate_weekly']} lbs/wk)")
+    st.metric("Start Bulk Rate",
+              f"{dp_start['bulk_rate_monthly']} lbs/mo ({dp_start['bulk_rate_weekly']} lbs/wk)")
     st.metric("Start Muscle % (Bulk)", f"{dp_start['muscle_frac_bulk']*100:.0f}%")
 
-    st.divider()
-    st.header("⚙️ Overrides")
-    st.caption("Optional — leave at 0 to use dynamic values.")
-    bulk_rate_override   = st.number_input("Bulk rate (lbs/week)", 0.0, 2.0, 0.0, 0.05)
-    cut_rate_override    = st.number_input("Cut rate (lbs/week)",  0.0, 2.0, 0.0, 0.05)
-    bulk_muscle_override = st.number_input("Muscle % on bulk", 0, 100, 0, 1)
-    cut_muscle_override  = st.number_input("Muscle loss % on cut", 0, 100, 0, 1)
+    # ── optional: manual overrides (collapsed) ─────────────────────────────────
+    with st.expander("⚙️ Rate overrides (optional)", expanded=False):
+        st.caption("Force specific rates/ratios. Leave at 0 to use dynamic values.")
+        bulk_rate_override   = st.number_input("Bulk rate (lbs/week)", 0.0, 2.0, 0.0, 0.05)
+        cut_rate_override    = st.number_input("Cut rate (lbs/week)",  0.0, 2.0, 0.0, 0.05)
+        bulk_muscle_override = st.number_input("Muscle % on bulk", 0, 100, 0, 1)
+        cut_muscle_override  = st.number_input("Muscle loss % on cut", 0, 100, 0, 1)
 
-    st.divider()
-    st.header("⚙️ Auto Schedule Settings")
-    max_weeks = st.slider("Maximum total weeks", 26, 260, 156, 2,
-                          help="52 = 1 yr, 104 = 2 yr, 156 = 3 yr.")
-    max_phase_weeks = st.slider("Max weeks per phase", 4, 32, 20, 1)
+    # ── optional: auto-schedule settings (collapsed) ───────────────────────────
+    with st.expander("⚙️ Auto-schedule settings (optional)", expanded=False):
+        st.caption("Only affect the auto scheduler, not manual mode.")
+        max_weeks = st.slider("Maximum total weeks", 26, 260, 156, 2,
+                              help="52 = 1 yr, 104 = 2 yr, 156 = 3 yr.")
+        max_phase_weeks = st.slider("Max weeks per phase", 4, 32, 20, 1)
 
-    st.divider()
-    st.header("🗓️ Start Date")
-    start_date = st.date_input("Start date", value=date(2026, 6, 13))
+    # ── optional: start date (collapsed) ───────────────────────────────────────
+    with st.expander("🗓️ Start date (optional)", expanded=False):
+        start_date = st.date_input("Start date", value=date(2026, 6, 13))
 
 overrides = {
     "bulk_rate":   bulk_rate_override,
@@ -305,27 +370,32 @@ overrides = {
     "cut_muscle":  cut_muscle_override,
 }
 
-# ── Build the schedule (cached so live reruns stay snappy) ───────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SCHEDULE (cached)
+# ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(show_spinner="Optimizing schedule…")
-def cached_schedule(sw, sbf, gw, gbf, ceil, floor, static_tuple, ov_tuple, mw, mpw):
-    static_d = {"height_m": static_tuple[0], "ffmi_ceiling": static_tuple[1]}
+def cached_schedule(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw, mpw):
+    frame_d = {"height_in": frame_tuple[0], "ceiling_lean": frame_tuple[1],
+               "baseline_lean": frame_tuple[2], "ffmi_ceiling": frame_tuple[3]}
     ov = {"bulk_rate": ov_tuple[0], "cut_rate": ov_tuple[1],
           "bulk_muscle": ov_tuple[2], "cut_muscle": ov_tuple[3]}
-    return auto_schedule_dynamic(sw, sbf, gw, gbf, ceil, floor, static_d, ov,
+    return auto_schedule_dynamic(sw, sbf, gw, gbf, ceil, floor, frame_d, ov,
                                  max_weeks=mw, max_phase_weeks=mpw)
 
 auto_phases = cached_schedule(
     start_weight, start_bf, goal_weight, goal_bf, bf_ceiling, bf_floor,
-    (static["height_m"], static["ffmi_ceiling"]),
+    (frame["height_in"], frame["ceiling_lean"], frame["baseline_lean"], frame["ffmi_ceiling"]),
     (bulk_rate_override, cut_rate_override, bulk_muscle_override, cut_muscle_override),
     max_weeks, max_phase_weeks,
 )
 
-# ── Mode UI ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MODE UI
+# ══════════════════════════════════════════════════════════════════════════════
 if mode == "🤖 Auto Schedule":
     st.subheader("🤖 Auto-Generated Schedule")
-    st.caption("Phases chosen by 2-phase look-ahead using the dynamic engine. "
-               "All numbers below come from the dynamic simulation.")
+    st.caption("Phases chosen by 2-phase look-ahead. All numbers below come from "
+               "the dynamic simulation.")
     active_phases = auto_phases
 else:
     st.subheader("🔧 Manual Phase Builder")
@@ -372,8 +442,10 @@ else:
 
     active_phases = st.session_state.phases
 
-# ── Single dynamic simulation feeds everything ──────────────────────────────────
-data = simulate_dynamic(start_weight, start_bf, active_phases, static, start_date, overrides)
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMULATION + SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+data = simulate_dynamic(start_weight, start_bf, active_phases, frame, start_date, overrides)
 
 final = data[-1]
 start = data[0]
@@ -382,7 +454,6 @@ lean_gained = round(final["lean"] - start["lean"], 1)
 peak_bf_row = max(data, key=lambda r: r["bf"])
 on_track = abs(final["weight"] - goal_weight) <= 2 and abs(final["bf"] - goal_bf) <= 1.5
 
-# Auto-schedule summary (now pulled from the dynamic sim — single source of truth)
 if mode == "🤖 Auto Schedule":
     cA, cB, cC = st.columns(3)
     cA.metric("Total Weeks", f"{total_weeks}")
@@ -413,7 +484,9 @@ else:
                f"(off by {gw_gap:+.1f} lbs, {gbf_gap:+.1f}% BF). "
                f"This is the honest limit given your rates — extend max weeks or adjust goal.")
 
-# ── Charts ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CHARTS
+# ══════════════════════════════════════════════════════════════════════════════
 st.divider()
 st.subheader("📈 Charts")
 COLORS = {"bulk": "#10b981", "cut": "#ef4444", "maintain": "#f59e0b", "start": "#6366f1"}
@@ -464,7 +537,9 @@ fig.update_xaxes(gridcolor="#1e293b", showgrid=True)
 fig.update_yaxes(gridcolor="#1e293b", showgrid=True)
 st.plotly_chart(fig, use_container_width=True)
 
-# ── Table ────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# TABLE
+# ══════════════════════════════════════════════════════════════════════════════
 st.divider()
 st.subheader("📅 Week-by-Week Breakdown")
 with st.expander("Show full table", expanded=False):
