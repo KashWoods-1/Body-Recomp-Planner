@@ -98,19 +98,12 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
     bulk_rate_weekly  = round(bulk_rate_yr / 52.0, 3)
     bulk_rate_monthly = round(bulk_rate_yr / 12.0, 2)
 
-    # ── Cut rate scales with CURRENT body fat (leaner = cut slower) ─────────────
-    # Anchored to Helms/research: ~1%/wk of bodyweight at 20% BF, ~0.5%/wk at 12%,
-    # ~0.4%/wk at 10%. Expressed as % of bodyweight per week, then applied to the
-    # current weight in step_week. Lean mass alone can't give weight, so we derive
-    # an approximate current weight from lean + current_bf.
-    if current_bf <= 10:
-        cut_pct_wk = 0.40
-    elif current_bf <= 15:
-        cut_pct_wk = 0.40 + (current_bf - 10) / 5 * 0.25      # 10->0.40, 15->0.65
-    elif current_bf <= 20:
-        cut_pct_wk = 0.65 + (current_bf - 15) / 5 * 0.35      # 15->0.65, 20->1.00
-    else:
-        cut_pct_wk = min(1.10, 1.00 + (current_bf - 20) / 5 * 0.10)
+    # ── Cut rate scales smoothly with CURRENT body fat (leaner = cut slower) ────
+    # Continuous exponential, no threshold kinks. Anchored to the muscle-
+    # PRESERVATION end of Helms/Garthe: ~0.5%/wk at 15% BF, ~0.8%/wk at 20%,
+    # tapering to ~0.3%/wk when very lean, capped at 1.0%/wk at high BF.
+    cut_pct_wk = 0.1221 * math.exp(0.0940 * current_bf)
+    cut_pct_wk = max(0.30, min(1.00, cut_pct_wk))
 
     approx_weight    = lean_for_calc / (1 - current_bf / 100)
     cut_rate_weekly  = round(approx_weight * cut_pct_wk / 100, 3)
@@ -119,8 +112,9 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
     # Lean-loss fraction: keyed off cut rate as % of bodyweight/wk (scale-invariant),
     # rising with aggressiveness and at low body fat. Advanced lifters retain better.
     # Anchors (Helms/Garthe): 0.5%/wk ~10%, 1.0%/wk ~20%, 1.4%/wk ~30%.
+    # Leanness penalty uses softplus (smooth max) so there's no kink at 15% BF.
     base_cut_loss    = 0.05 + (cut_pct_wk ** 1.5) * 0.16
-    leanness_penalty = max(0, (15 - current_bf)) * 0.012      # +1.2pp per % under 15
+    leanness_penalty = 0.012 * 0.5 * math.log1p(math.exp(2.0 * (15 - current_bf)))
     muscle_frac_cut  = round(max(0.06, min(0.55,
                         base_cut_loss + leanness_penalty - prox * 0.03)), 3)
 
@@ -159,7 +153,7 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides):
         # on the same scale whether the rate is dynamic or overridden.
         cut_pct_wk_eff = cut_rate / w * 100
         base = 0.05 + (cut_pct_wk_eff ** 1.5) * 0.16
-        leanness_penalty = max(0, (15 - current_bf)) * 0.012
+        leanness_penalty = 0.012 * 0.5 * math.log1p(math.exp(2.0 * (15 - current_bf)))
         mfrac_cut = max(0.06, min(0.55,
             base + leanness_penalty - dp["ceiling_pct"] / 100 * 0.03))
 
@@ -168,9 +162,18 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides):
         fat  += bulk_rate * (1 - mfrac_bulk)
         w    += bulk_rate
     elif action == "cut":
-        lean -= cut_rate * mfrac_cut
-        fat  -= cut_rate * (1 - mfrac_cut)
-        w    -= cut_rate
+        # Essential-fat floor: a natural lifter cannot cut below ~5% BF. Stop
+        # removing fat once there, so the model can never produce impossible
+        # sub-essential body-fat outcomes.
+        ESSENTIAL_BF = 5.0
+        min_fat = lean * (ESSENTIAL_BF / 100) / (1 - ESSENTIAL_BF / 100)
+        fat_loss   = cut_rate * (1 - mfrac_cut)
+        lean_loss  = cut_rate * mfrac_cut
+        if fat - fat_loss < min_fat:
+            fat_loss = max(0, fat - min_fat)   # only remove down to the floor
+        lean -= lean_loss
+        fat  -= fat_loss
+        w     = lean + fat
     else:
         lean += 0.012; fat += 0.012; w += 0.023
 
@@ -221,10 +224,17 @@ def _roll_phase(state, action, weeks, frame, overrides):
         w, lean, fat, peak, *_ = step_week(w, lean, fat, peak, action, frame, overrides)
     return (w, lean, fat, peak)
 
-def _goal_distance(state, goal_weight, goal_bf):
+def _goal_distance(state, goal_weight, goal_bf, bf_floor=None):
     w, lean, fat, peak = state
     bf = fat / w * 100
-    return abs(w - goal_weight) + abs(bf - goal_bf)
+    d = abs(w - goal_weight) + abs(bf - goal_bf)
+    # Heavy penalty only for genuinely unhealthy body fat (hard physiological
+    # floor), NOT the user's soft preference floor — otherwise, when the goal BF
+    # equals the cut floor, the scheduler refuses to cut to goal and stops short.
+    HARD_FLOOR = 8.0
+    if bf < HARD_FLOOR:
+        d += (HARD_FLOOR - bf) * 100
+    return d
 
 def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
                           bf_ceiling, bf_floor, frame, overrides,
@@ -270,16 +280,20 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
             next_action = "cut" if action == "bulk" else "bulk"
             weeks_left2 = weeks_left - this_len
             hi2 = min(max_phase_weeks, weeks_left2)
+            # Score "stop after this phase" (1-deep) as a valid option, so a
+            # finishing phase that lands on goal isn't penalized by a forced
+            # follow-up phase it doesn't actually need.
+            score_1deep = _goal_distance(s1, goal_weight, goal_bf, bf_floor)
             if hi2 >= min_phase_weeks:
                 best2 = None
                 for next_len in range(min_phase_weeks, hi2 + 1):
                     s2 = _roll_phase(s1, next_action, next_len, frame, overrides)
-                    d = _goal_distance(s2, goal_weight, goal_bf)
+                    d = _goal_distance(s2, goal_weight, goal_bf, bf_floor)
                     if best2 is None or d < best2:
                         best2 = d
-                score = best2 if best2 is not None else _goal_distance(s1, goal_weight, goal_bf)
+                score = min(score_1deep, best2) if best2 is not None else score_1deep
             else:
-                score = _goal_distance(s1, goal_weight, goal_bf)
+                score = score_1deep
 
             if best is None or score < best[0]:
                 best = (score, this_len)
