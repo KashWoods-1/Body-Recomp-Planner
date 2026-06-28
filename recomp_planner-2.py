@@ -77,7 +77,7 @@ def build_frame(height_in, wrist_in, ankle_in, age,
 CURVE_MAXRATE_YR = 20.2   # lbs/yr at zero proximity
 CURVE_K          = 1.8    # decay exponent
 
-def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None):
+def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0):
     ceiling  = frame["ceiling_lean"]
     baseline = frame["baseline_lean"]
     height_in = frame["height_in"]
@@ -98,12 +98,31 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None):
     bulk_rate_weekly  = round(bulk_rate_yr / 52.0, 3)
     bulk_rate_monthly = round(bulk_rate_yr / 12.0, 2)
 
-    # Cut side: rate rises slightly with proximity; lean-loss fraction scales
-    # with cut aggressiveness (set later from the actual cut rate in use).
-    cut_rate_monthly = round(0.75 + prox * 0.5, 2)
-    cut_rate_weekly  = round(cut_rate_monthly / 4.33, 3)
-    base_cut_loss    = 0.04 + (cut_rate_weekly ** 1.4) * 0.16
-    muscle_frac_cut  = round(max(0.06, min(0.55, base_cut_loss - prox * 0.03)), 3)
+    # ── Cut rate scales with CURRENT body fat (leaner = cut slower) ─────────────
+    # Anchored to Helms/research: ~1%/wk of bodyweight at 20% BF, ~0.5%/wk at 12%,
+    # ~0.4%/wk at 10%. Expressed as % of bodyweight per week, then applied to the
+    # current weight in step_week. Lean mass alone can't give weight, so we derive
+    # an approximate current weight from lean + current_bf.
+    if current_bf <= 10:
+        cut_pct_wk = 0.40
+    elif current_bf <= 15:
+        cut_pct_wk = 0.40 + (current_bf - 10) / 5 * 0.25      # 10->0.40, 15->0.65
+    elif current_bf <= 20:
+        cut_pct_wk = 0.65 + (current_bf - 15) / 5 * 0.35      # 15->0.65, 20->1.00
+    else:
+        cut_pct_wk = min(1.10, 1.00 + (current_bf - 20) / 5 * 0.10)
+
+    approx_weight    = lean_for_calc / (1 - current_bf / 100)
+    cut_rate_weekly  = round(approx_weight * cut_pct_wk / 100, 3)
+    cut_rate_monthly = round(cut_rate_weekly * 4.33, 2)
+
+    # Lean-loss fraction: keyed off cut rate as % of bodyweight/wk (scale-invariant),
+    # rising with aggressiveness and at low body fat. Advanced lifters retain better.
+    # Anchors (Helms/Garthe): 0.5%/wk ~10%, 1.0%/wk ~20%, 1.4%/wk ~30%.
+    base_cut_loss    = 0.05 + (cut_pct_wk ** 1.5) * 0.16
+    leanness_penalty = max(0, (15 - current_bf)) * 0.012      # +1.2pp per % under 15
+    muscle_frac_cut  = round(max(0.06, min(0.55,
+                        base_cut_loss + leanness_penalty - prox * 0.03)), 3)
 
     return {
         "ffmi": round(lean_to_norm_ffmi(lean_for_calc, height_in), 2),
@@ -121,7 +140,8 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None):
 # WEEKLY STEP (shared by scheduler + simulation)
 # ══════════════════════════════════════════════════════════════════════════════
 def step_week(w, lean, fat, peak_lean, action, frame, overrides):
-    dp = dynamic_profile(lean, frame, peak_lean_lbs=peak_lean)
+    current_bf = fat / w * 100
+    dp = dynamic_profile(lean, frame, peak_lean_lbs=peak_lean, current_bf=current_bf)
 
     bulk_rate = overrides["bulk_rate"] if overrides["bulk_rate"] > 0 else dp["bulk_rate_weekly"]
     cut_rate  = overrides["cut_rate"]  if overrides["cut_rate"]  > 0 else dp["cut_rate_weekly"]
@@ -134,8 +154,14 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides):
     if overrides["cut_muscle"] > 0:
         mfrac_cut = overrides["cut_muscle"] / 100
     else:
+        # recompute from the actual cut rate AND current leanness. Convert the
+        # cut rate in use back to % of bodyweight/wk so the lean-loss curve is
+        # on the same scale whether the rate is dynamic or overridden.
+        cut_pct_wk_eff = cut_rate / w * 100
+        base = 0.05 + (cut_pct_wk_eff ** 1.5) * 0.16
+        leanness_penalty = max(0, (15 - current_bf)) * 0.012
         mfrac_cut = max(0.06, min(0.55,
-            0.04 + (cut_rate ** 1.4) * 0.16 - dp["ceiling_pct"] / 100 * 0.03))
+            base + leanness_penalty - dp["ceiling_pct"] / 100 * 0.03))
 
     if action == "bulk":
         lean += bulk_rate * mfrac_bulk
@@ -330,7 +356,7 @@ with st.sidebar:
                         start_lean_weight=first_weight if first_weight > 0 else None)
 
     start_lean = start_weight * (1 - start_bf / 100)
-    dp_start = dynamic_profile(start_lean, frame)
+    dp_start = dynamic_profile(start_lean, frame, current_bf=start_bf)
 
     st.divider()
     st.header("📐 Your Profile (starting)")
@@ -343,6 +369,19 @@ with st.sidebar:
     st.metric("Start Bulk Rate",
               f"{dp_start['bulk_rate_monthly']} lbs/mo ({dp_start['bulk_rate_weekly']} lbs/wk)")
     st.metric("Start Muscle % (Bulk)", f"{dp_start['muscle_frac_bulk']*100:.0f}%")
+    st.metric("Start Cut Rate",
+              f"{dp_start['cut_rate_monthly']} lbs/mo ({dp_start['cut_rate_weekly']} lbs/wk)",
+              help="Research target is 0.5-1%/wk of bodyweight for muscle retention; "
+                   "this sits at the conservative end and rises slightly as you advance.")
+    st.metric("Start Muscle Loss % (Cut)", f"{dp_start['muscle_frac_cut']*100:.0f}%",
+              help="Share of each lost pound that is lean. Scales with cut "
+                   "aggressiveness, per Helms/Garthe: faster cuts lose more muscle.")
+
+    st.divider()
+    st.header("📅 Schedule Length")
+    max_weeks = st.slider("Maximum total weeks", 26, 260, 156, 2,
+                          help="52 = 1 yr, 104 = 2 yr, 156 = 3 yr.")
+    max_phase_weeks = st.slider("Max weeks per phase", 4, 32, 20, 1)
 
     # ── optional: manual overrides (collapsed) ─────────────────────────────────
     with st.expander("⚙️ Rate overrides (optional)", expanded=False):
@@ -351,13 +390,6 @@ with st.sidebar:
         cut_rate_override    = st.number_input("Cut rate (lbs/week)",  0.0, 2.0, 0.0, 0.05)
         bulk_muscle_override = st.number_input("Muscle % on bulk", 0, 100, 0, 1)
         cut_muscle_override  = st.number_input("Muscle loss % on cut", 0, 100, 0, 1)
-
-    # ── optional: auto-schedule settings (collapsed) ───────────────────────────
-    with st.expander("⚙️ Auto-schedule settings (optional)", expanded=False):
-        st.caption("Only affect the auto scheduler, not manual mode.")
-        max_weeks = st.slider("Maximum total weeks", 26, 260, 156, 2,
-                              help="52 = 1 yr, 104 = 2 yr, 156 = 3 yr.")
-        max_phase_weeks = st.slider("Max weeks per phase", 4, 32, 20, 1)
 
     # ── optional: start date (collapsed) ───────────────────────────────────────
     with st.expander("🗓️ Start date (optional)", expanded=False):
