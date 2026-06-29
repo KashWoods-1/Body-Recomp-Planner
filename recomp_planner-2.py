@@ -356,7 +356,7 @@ with st.sidebar:
     goal_weight = st.number_input("Goal Weight (lbs)", 90.0, 300.0, 155.0, 0.5)
     goal_bf     = st.number_input("Goal Body Fat %",   5.0, 40.0, 15.0, 0.5)
     bf_ceiling  = st.number_input("Max BF% (ceiling)", 8.0, 35.0, 17.0, 0.5)
-    bf_floor    = st.number_input("Min BF% (floor)",   4.0, 25.0, 10.0, 0.5)
+    bf_floor    = st.number_input("Min BF% (floor)",   4.0, 25.0, 14.5, 0.5)
 
     st.divider()
     st.header("⚙️ Mode")
