@@ -174,8 +174,11 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides):
         lean -= lean_loss
         fat  -= fat_loss
         w     = lean + fat
-    else:
-        lean += 0.012; fat += 0.012; w += 0.023
+    else:  # maintain — true flat hold: composition unchanged for the duration.
+        # Used in manual mode to model a known off-plan stretch (vacation, deload,
+        # work crunch). The auto-scheduler never generates maintain phases, since
+        # holding still is never optimal for a minimum-time-to-goal objective.
+        pass
 
     peak_lean = max(peak_lean, lean)
     return w, lean, fat, peak_lean, bulk_rate, mfrac_bulk, cut_rate, mfrac_cut
@@ -353,7 +356,7 @@ with st.sidebar:
     goal_weight = st.number_input("Goal Weight (lbs)", 90.0, 300.0, 155.0, 0.5)
     goal_bf     = st.number_input("Goal Body Fat %",   5.0, 40.0, 15.0, 0.5)
     bf_ceiling  = st.number_input("Max BF% (ceiling)", 8.0, 35.0, 17.0, 0.5)
-    bf_floor    = st.number_input("Min BF% (floor)",   4.0, 25.0, 13.0, 0.5)
+    bf_floor    = st.number_input("Min BF% (floor)",   4.0, 25.0, 15.0, 0.5)
 
     st.divider()
     st.header("⚙️ Mode")
