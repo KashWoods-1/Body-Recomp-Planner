@@ -104,20 +104,48 @@ def build_frame(height_in, wrist_in, ankle_in, age, sex="Male",
 CURVE_MAXRATE_YR = 20.2   # lbs/yr at zero proximity
 CURVE_K          = 1.8    # decay exponent
 
-def muscle_frac_cut_model(cut_pct_wk, current_bf, prox):
-    """Share of each lost pound that is lean, as one shared function so the
-    profile display and the weekly step can never drift apart.
+# ── Recomp (slow-cut lean gain) parameters, calibrated to Garthe 2011 ─────────
+# Garthe's slow group lost 0.7%/wk of bodyweight and GAINED 2.1% LBM over 8.5wk
+# (~+0.33 lbs lean/wk for a ~159 lb athlete); the fast group at 1.0%/wk was flat.
+# Both trained 4x/wk. The original model only allowed lean gain below 0.55%/wk
+# and capped it at -10% of the cut rate — which (a) showed LOSS at the exact
+# 0.7%/wk where Garthe measured GAIN and (b) under-predicted the magnitude ~3x.
+# These three constants are tuned so a low-proximity lifter reproduces Garthe's
+# ~0.33 lbs/wk at 0.7%/wk, while the (1-prox)^2 gate keeps advanced lifters near
+# zero recomp (consistent with Helms: highly trained lifters recomp poorly).
+RECOMP_MID   = 0.75   # %/wk sigmoid midpoint of the recomp->loss transition
+RECOMP_WIDTH = 0.12   # transition sharpness (smaller = sharper, but always C-inf)
+RECOMP_MAG   = 0.605  # peak recomp fraction, tuned to Garthe ~+0.33 lbs/wk @0.6-0.7%/wk
+RECOMP_FLOOR = -0.35  # max lean-GAIN fraction of the cut rate (was -0.10)
 
-    Anchors (Helms/Garthe): 0.5%/wk ~10%, 1.0%/wk ~20%, 1.4%/wk ~30%.
-    Leanness penalty uses softplus (smooth max) so there's no kink at 15% BF.
-    Recomp term (Garthe): very slow cuts (<0.55%/wk) far from the ceiling can
-    show slight lean GAIN — the fraction may go mildly negative, floored at -10%.
-    The (1-prox)^2 factor kills the effect for advanced lifters.
+def muscle_frac_cut_model(cut_pct_wk, current_bf, prox, allow_recomp=True):
+    """Share of each lost pound that is lean, as one shared function so the
+    profile display and the weekly step can never drift apart. A NEGATIVE value
+    means net lean GAIN while losing fat (recomp) — only possible when
+    allow_recomp is True.
+
+    Anchors: Helms 2014 (0.5-1%/wk to retain LBM; loss fraction rises with the
+    deficit and with leanness) and Garthe 2011 (slow cut ~0.7%/wk -> +2.1% LBM
+    in trained-but-not-advanced athletes). The recomp term fades through a
+    logistic centered at RECOMP_MID, so there's no kink where it hands off to
+    lean loss. The (1-prox)^2 factor reduces recomp for advanced lifters (Helms:
+    highly trained lifters recomp poorly) — but that gate is a modeling guess,
+    so recomp is OPT-IN: with it off, the best case on a slow cut is ~zero lean
+    loss, never lean gain. Note the fast end stays conservative either way: at
+    1%/wk this predicts ~20% lean loss for a typical trainee — Garthe's elite
+    fast group held LBM, but that reflects optimized training/protein this
+    general model doesn't assume. Validated in tests.
     """
     base             = 0.05 + (cut_pct_wk ** 1.5) * 0.16
     leanness_penalty = 0.012 * 0.5 * math.log1p(math.exp(2.0 * (15 - current_bf)))
-    recomp           = -((1 - prox) ** 2) * max(0.0, 0.55 - cut_pct_wk) * 0.35
-    return max(-0.10, min(0.55, base + leanness_penalty + recomp - prox * 0.03))
+    if allow_recomp:
+        recomp_fade = 1.0 / (1.0 + math.exp((cut_pct_wk - RECOMP_MID) / RECOMP_WIDTH))
+        recomp      = -((1 - prox) ** 2) * RECOMP_MAG * recomp_fade
+        floor       = RECOMP_FLOOR
+    else:
+        recomp = 0.0
+        floor  = 0.0   # best case with recomp off: hold lean, never gain it
+    return max(floor, min(0.55, base + leanness_penalty + recomp - prox * 0.03))
 
 def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0):
     ceiling  = frame["ceiling_lean"]
@@ -162,7 +190,8 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
     cut_rate_weekly  = round(approx_weight * cut_pct_wk / 100, 3)
     cut_rate_monthly = round(cut_rate_weekly * 4.33, 2)
 
-    muscle_frac_cut = round(muscle_frac_cut_model(cut_pct_wk, current_bf, prox), 3)
+    muscle_frac_cut = round(muscle_frac_cut_model(cut_pct_wk, current_bf, prox,
+                        frame.get("allow_recomp", True)), 3)
 
     return {
         "ffmi": round(lean_to_norm_ffmi(lean_for_prox, height_in), 2),
@@ -213,7 +242,8 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides, mods=None):
         # on the same scale whether the rate is dynamic or overridden.
         cut_pct_wk_eff = cut_rate / w * 100
         mfrac_cut = muscle_frac_cut_model(cut_pct_wk_eff, current_bf,
-                                          dp["ceiling_pct"] / 100)
+                                          dp["ceiling_pct"] / 100,
+                                          frame.get("allow_recomp", True))
 
     applied_rate = 0.0
     applied_frac = 0.0
@@ -288,6 +318,197 @@ def simulate_dynamic(start_weight, start_bf, phases, frame, start_date, override
             })
             idx += 1
     return rows
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MONTE CARLO UNCERTAINTY ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+# Two orthogonal questions from one ensemble of trajectories:
+#   (1) WHEN do I reach goal?   -> spread of goal-crossing weeks  (horizontal CI)
+#   (2) WHERE am I at week E?    -> spread of weight/BF at the headline week E
+#                                   (vertical CI)
+# We fix the plan the user would actually follow (the expected-optimal schedule)
+# and perturb the two things we genuinely don't know: the starting BF (a noisy
+# measurement) and the individual RATE response (population rates ± personal
+# variation). Re-running the full scheduler per sample is ~150x slower and buys
+# little — the decision is fixed; what varies is the body's response to it. Once
+# a trajectory reaches goal it switches to maintenance (you'd stop cutting), so
+# fast responders plateau at goal instead of overshooting.
+
+def _extend_plan_for_mc(phases, max_weeks, max_phase_weeks):
+    """Lengthen the expected plan out to max_weeks so slower-than-expected
+    responders still have room to reach goal. We extend with a short ALTERNATING
+    bulk/cut pattern rather than repeating the tail: a slow responder is short on
+    some mix of weight and leanness, and alternation lets them converge from
+    whichever side they're on instead of being pushed past goal in one direction.
+    Goal-hold (in _simulate_to_goal) freezes each trajectory the moment it
+    arrives, so the alternation only acts on samples that haven't gotten there."""
+    ext = [dict(p) for p in phases]
+    if not ext:
+        return ext
+    total = sum(p["weeks"] for p in ext)
+    nxt = "cut" if ext[-1]["type"] == "bulk" else "bulk"
+    chunk = min(4, max_phase_weeks)
+    while total < max_weeks:
+        add = min(chunk, max_weeks - total)
+        ext.append({"name": f"{nxt.capitalize()} (cont.)", "type": nxt, "weeks": add})
+        total += add
+        nxt = "cut" if nxt == "bulk" else "bulk"
+    return ext
+
+def _simulate_to_goal(start_weight, start_bf, phases, frame, overrides, mods,
+                      prior_peak, goal_weight, goal_bf,
+                      tol_w=0.6, tol_bf=0.4):
+    """Simulate the (extended) plan, switching to maintenance once goal is hit.
+    Returns (trajectory, crossing_week or None). Trajectory rows are
+    (week, weight, bf, lean)."""
+    w = start_weight
+    lean = start_weight * (1 - start_bf / 100)
+    fat = start_weight * (start_bf / 100)
+    peak = max(lean, prior_peak) if prior_peak else lean
+    traj = [(0, w, fat / w * 100, lean)]
+    crossed = None
+    idx = 1
+    for phase in phases:
+        pt = phase["type"]
+        for _ in range(phase.get("weeks", 4)):
+            action = "maintain" if crossed is not None else pt
+            w, lean, fat, peak, _, _ = step_week(w, lean, fat, peak, action,
+                                                 frame, overrides, mods)
+            bf = fat / w * 100
+            traj.append((idx, w, bf, lean))
+            if crossed is None and abs(w - goal_weight) <= tol_w and bf <= goal_bf + tol_bf:
+                crossed = idx
+            idx += 1
+    return traj, crossed
+
+def _percentile(sorted_vals, q):
+    """Linear-interpolated percentile (q in 0..1) on a pre-sorted list."""
+    if not sorted_vals:
+        return None
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    pos = q * (len(sorted_vals) - 1)
+    lo = int(math.floor(pos)); hi = int(math.ceil(pos))
+    if lo == hi:
+        return sorted_vals[lo]
+    frac = pos - lo
+    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+def timeline_ci_full(start_weight, start_bf, goal_weight, goal_bf, bf_ceiling,
+                     bf_floor, frame, overrides, mods, prior_peak, max_weeks,
+                     max_phase_weeks, n_samples=24, bf_sd=1.0, rate_cv=0.12, seed=7):
+    """Timeline confidence interval done the honest way: each sample RE-OPTIMIZES
+    the whole schedule for its perturbed start-BF and rate response, so every
+    sample reaches goal on its own optimal path (no tolerance-box artifacts from
+    a fixed plan). Fewer samples than the envelope MC because each full schedule
+    is ~150x costlier, but 24 is plenty to characterize a p10-p90 week range.
+    Returns p10/p50/p90 weeks-to-goal and the fraction reaching within max_weeks."""
+    import random
+    rng = random.Random(seed)
+
+    def _clamp(x, lo, hi): return max(lo, min(hi, x))
+    weeks = []
+    reached_ct = 0
+    for _ in range(n_samples):
+        sbf = _clamp(rng.gauss(start_bf, bf_sd), 5.0, 40.0)
+        bmul = mods["bulk_mult"] * _clamp(rng.gauss(1.0, rate_cv), 0.45, 1.7)
+        cmul = mods["cut_mult"]  * _clamp(rng.gauss(1.0, rate_cv), 0.45, 1.7)
+        m = {"bulk_mult": bmul, "cut_mult": cmul}
+        ph = auto_schedule_dynamic(start_weight, sbf, goal_weight, goal_bf,
+                                   bf_ceiling, bf_floor, frame, overrides,
+                                   max_weeks=max_weeks, max_phase_weeks=max_phase_weeks,
+                                   mods=m, prior_peak=prior_peak)
+        rows = simulate_dynamic(start_weight, sbf, ph, frame, date(2000, 1, 3),
+                                overrides, mods=m, prior_peak=prior_peak)
+        f = rows[-1]
+        if abs(f["weight"] - goal_weight) <= 2 and abs(f["bf"] - goal_bf) <= 1.5:
+            weeks.append(f["week"]); reached_ct += 1
+    if not weeks:
+        return None
+    weeks.sort()
+    return {
+        "p10": _percentile(weeks, 0.10),
+        "p50": _percentile(weeks, 0.50),
+        "p90": _percentile(weeks, 0.90),
+        "frac_reached": reached_ct / n_samples,
+        "n": n_samples,
+    }
+
+def monte_carlo_bands(start_weight, start_bf, expected_phases, frame, overrides,
+                      mods, prior_peak, goal_weight, goal_bf, max_weeks,
+                      max_phase_weeks, headline_week,
+                      n_samples=200, bf_sd=1.0, rate_cv=0.12, seed=42):
+    """Run n_samples perturbed simulations of the fixed plan. Returns a dict with
+    per-week p10/p50/p90 envelopes for weight/BF/lean, the goal-crossing-week
+    distribution (timeline CI), and the weight/BF distribution AT headline_week
+    (outcome CI). Start WEIGHT is held fixed (scale is precise); start BF and the
+    bulk/cut rate multipliers are the perturbed unknowns."""
+    import random
+    rng = random.Random(seed)
+    ext = _extend_plan_for_mc(expected_phases, max_weeks, max_phase_weeks)
+    horizon = sum(p["weeks"] for p in ext)
+
+    # week -> lists of sampled values across trajectories (forward-filled at goal
+    # because _simulate_to_goal holds composition once goal is reached)
+    wk_weight = [[] for _ in range(horizon + 1)]
+    wk_bf     = [[] for _ in range(horizon + 1)]
+    wk_lean   = [[] for _ in range(horizon + 1)]
+    crossings = []
+
+    def _clamp(x, lo, hi): return max(lo, min(hi, x))
+
+    for _ in range(n_samples):
+        sbf = _clamp(rng.gauss(start_bf, bf_sd), 5.0, 40.0)
+        bmul = mods["bulk_mult"] * _clamp(rng.gauss(1.0, rate_cv), 0.45, 1.7)
+        cmul = mods["cut_mult"]  * _clamp(rng.gauss(1.0, rate_cv), 0.45, 1.7)
+        m = {"bulk_mult": bmul, "cut_mult": cmul}
+        traj, crossed = _simulate_to_goal(start_weight, sbf, ext, frame, overrides,
+                                          m, prior_peak, goal_weight, goal_bf)
+        crossings.append(crossed if crossed is not None else None)
+        for (wk, w, bf, lean) in traj:
+            wk_weight[wk].append(w)
+            wk_bf[wk].append(bf)
+            wk_lean[wk].append(lean)
+
+    def _band(series):
+        p10, p50, p90 = [], [], []
+        for vals in series:
+            if not vals:
+                p10.append(None); p50.append(None); p90.append(None); continue
+            s = sorted(vals)
+            p10.append(_percentile(s, 0.10))
+            p50.append(_percentile(s, 0.50))
+            p90.append(_percentile(s, 0.90))
+        return p10, p50, p90
+
+    w10, w50, w90 = _band(wk_weight)
+    b10, b50, b90 = _band(wk_bf)
+    l10, l50, l90 = _band(wk_lean)
+
+    reached = sorted(c for c in crossings if c is not None)
+    frac_reached = len(reached) / max(1, len(crossings))
+    timeline = None
+    if reached:
+        timeline = {
+            "p10": _percentile(reached, 0.10),
+            "p50": _percentile(reached, 0.50),
+            "p90": _percentile(reached, 0.90),
+            "frac_reached": frac_reached,
+        }
+
+    he = min(max(headline_week, 0), horizon)
+    outcome = {
+        "week": he,
+        "weight_p10": w10[he], "weight_p50": w50[he], "weight_p90": w90[he],
+        "bf_p10": b10[he], "bf_p50": b50[he], "bf_p90": b90[he],
+    }
+
+    return {
+        "weeks": list(range(horizon + 1)),
+        "weight": (w10, w50, w90), "bf": (b10, b50, b90), "lean": (l10, l50, l90),
+        "timeline": timeline, "outcome": outcome,
+        "n_samples": n_samples, "bf_sd": bf_sd, "rate_cv": rate_cv,
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DYNAMIC LOOK-AHEAD SCHEDULER
@@ -538,6 +759,31 @@ with st.sidebar:
              "eating over maintenance, which erases deficit disproportionately. "
              "At 100% this has no effect.")
 
+    allow_recomp = st.checkbox(
+        "Allow slow-cut recomp (lean gain on slow cuts)", value=False,
+        help="Garthe 2011: trained-but-not-advanced athletes GAINED lean mass "
+             "cutting at ~0.7%/wk. With this on, slow cuts can add a little "
+             "lean for lifters far from their ceiling. Off (default) is the "
+             "conservative assumption: a good slow cut can HOLD lean, never "
+             "add it. Leave off unless you are a novice or returning after "
+             "a long layoff.")
+
+    with st.expander("🎲 Uncertainty settings (optional)", expanded=False):
+        st.caption("The confidence bands come from Monte Carlo simulation of the "
+                   "two things the model genuinely doesn't know: your TRUE start "
+                   "BF (scales and DEXA both have measurement error) and your "
+                   "personal rate response vs. the population curve. These bands "
+                   "are NOT limited by your max-weeks setting — slow-response "
+                   "scenarios are allowed to finish late.")
+        bf_sd_ui   = st.slider("Start-BF measurement error (SD, ±%)", 0.5, 2.5, 1.0, 0.25,
+                               help="1.0 ≈ DEXA-grade measurement. 2.0+ if you're "
+                                    "estimating BF visually or from a scale.")
+        rate_cv_ui = st.slider("Personal rate variability (CV, %)", 5, 25, 12, 1,
+                               help="How much individual bulk/cut response varies "
+                                    "around the population curve. 12% is a "
+                                    "moderate default; widen if you have no "
+                                    "training history to judge from.")
+
     st.divider()
     st.header("⚙️ Mode")
     mode = st.radio("Planning mode", ["🤖 Auto Schedule", "🔧 Manual Phases"])
@@ -551,6 +797,7 @@ with st.sidebar:
     frame = build_frame(height_in_total, wrist_in, ankle_in, age, sex=sex,
                         start_lean=start_lean_from_first,
                         start_lean_weight=first_weight if first_weight > 0 else None)
+    frame["allow_recomp"] = allow_recomp
 
     prior_peak = prior_peak_in if prior_peak_in > 0 else None
     start_lean = start_weight * (1 - start_bf / 100)
@@ -663,7 +910,7 @@ overrides = {
 # ══════════════════════════════════════════════════════════════════════════════
 def _frame_from_tuple(t):
     return {"height_in": t[0], "ceiling_lean": t[1], "baseline_lean": t[2],
-            "ffmi_ceiling": t[3], "rate_mult": t[4]}
+            "ffmi_ceiling": t[3], "rate_mult": t[4], "allow_recomp": t[5]}
 
 def _ov_from_tuple(t):
     return {"bulk_rate": t[0], "cut_rate": t[1], "bulk_muscle": t[2], "cut_muscle": t[3]}
@@ -680,32 +927,35 @@ def cached_schedule(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw, mp
         max_weeks=mw, max_phase_weeks=mpw,
         mods=_mods_from_tuple(mods_tuple), prior_peak=prior_peak)
 
-@st.cache_data(show_spinner="Computing timeline confidence band…")
-def cached_band(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw, mpw,
-                mods_tuple, prior_peak):
-    """Run the full plan at start-BF -2 / base / +2 to turn BF measurement error
-    into a WEEKS range. BF error mostly cancels for the goal itself but drives
-    the rates, so this is timeline uncertainty, not goal uncertainty. The band
-    is naturally tighter for novices (fast, robust rates) and wider near the
-    ceiling (slow rates amplify any input error)."""
-    frame_d = _frame_from_tuple(frame_tuple)
-    ov      = _ov_from_tuple(ov_tuple)
-    mods    = _mods_from_tuple(mods_tuple)
-    out = []
-    for dbf in (-2.0, 0.0, 2.0):
-        sbf_v = min(40.0, max(5.0, sbf + dbf))
-        ph = auto_schedule_dynamic(sw, sbf_v, gw, gbf, ceil, floor, frame_d, ov,
-                                   max_weeks=mw, max_phase_weeks=mpw,
-                                   mods=mods, prior_peak=prior_peak)
-        rows = simulate_dynamic(sw, sbf_v, ph, frame_d, date(2000, 1, 3), ov,
-                                mods=mods, prior_peak=prior_peak)
-        f = rows[-1]
-        reached = abs(f["weight"] - gw) <= 2 and abs(f["bf"] - gbf) <= 1.5
-        out.append({"dbf": dbf, "weeks": f["week"], "reached": reached})
-    return out
+@st.cache_data(show_spinner="Estimating timeline uncertainty (re-optimizing 24 scenarios)…")
+def cached_timeline_ci(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw, mpw,
+                       mods_tuple, prior_peak, bf_sd, rate_cv):
+    """Timeline CI via full re-optimization per sample. The horizon is
+    DELIBERATELY extended beyond the user's max-weeks setting (+104 wks) so the
+    high end of the CI reflects genuinely slow response scenarios instead of
+    being censored at the planning window."""
+    horizon = mw + 104
+    return timeline_ci_full(sw, sbf, gw, gbf, ceil, floor,
+                            _frame_from_tuple(frame_tuple), _ov_from_tuple(ov_tuple),
+                            _mods_from_tuple(mods_tuple), prior_peak,
+                            horizon, mpw, bf_sd=bf_sd, rate_cv=rate_cv)
+
+@st.cache_data(show_spinner="Simulating outcome envelope (200 scenarios)…")
+def cached_envelope(sw, sbf, phases_key, frame_tuple, ov_tuple, mods_tuple,
+                    prior_peak, gw, gbf, mw, mpw, headline, bf_sd, rate_cv):
+    """Per-week p10/p50/p90 envelope from 200 fixed-plan simulations, run out to
+    an extended horizon (max weeks + 104) so band edges aren't clipped by the
+    planning window either."""
+    phases = [{"name": f"{t.capitalize()}", "type": t, "weeks": wk}
+              for (t, wk) in phases_key]
+    horizon = mw + 104
+    return monte_carlo_bands(sw, sbf, phases, _frame_from_tuple(frame_tuple),
+                             _ov_from_tuple(ov_tuple), _mods_from_tuple(mods_tuple),
+                             prior_peak, gw, gbf, horizon, mpw, headline,
+                             n_samples=200, bf_sd=bf_sd, rate_cv=rate_cv)
 
 frame_tuple = (frame["height_in"], frame["ceiling_lean"], frame["baseline_lean"],
-               frame["ffmi_ceiling"], frame["rate_mult"])
+               frame["ffmi_ceiling"], frame["rate_mult"], frame["allow_recomp"])
 ov_tuple = (bulk_rate_override, cut_rate_override, bulk_muscle_override, cut_muscle_override)
 
 # ── Baseline (uncalibrated, 100%-consistency) projection: the fixed reference
@@ -835,25 +1085,53 @@ with c5:
     st.metric("Total Weeks", f"{total_weeks} wks")
     st.caption(f"≈ {round(total_weeks/4.33, 1)} months")
 
-# ── Timeline confidence band ───────────────────────────────────────────────────
-band = cached_band(start_weight, start_bf, goal_weight, goal_bf, bf_ceiling,
-                   bf_floor, frame_tuple, ov_tuple, max_weeks, max_phase_weeks,
-                   mods_tuple, prior_peak)
-band_weeks = [b["weeks"] for b in band]
-band_lo, band_hi = min(band_weeks), max(band_weeks)
-all_reached = all(b["reached"] for b in band)
-if band_lo == band_hi:
-    st.info(f"⏱️ **Timeline confidence band:** ~{band_lo} weeks even at ±2% start-BF "
-            f"measurement error. (Bands widen near your genetic ceiling, where "
-            f"slower rates amplify input error.)")
+# ── Uncertainty: timeline CI + outcome-at-headline CI ─────────────────────────
+tl_ci = cached_timeline_ci(start_weight, start_bf, goal_weight, goal_bf,
+                           bf_ceiling, bf_floor, frame_tuple, ov_tuple,
+                           max_weeks, max_phase_weeks, mods_tuple, prior_peak,
+                           bf_sd_ui, rate_cv_ui / 100.0)
+phases_key = tuple((p["type"], p.get("weeks", 4)) for p in active_phases)
+envelope = cached_envelope(start_weight, start_bf, phases_key, frame_tuple,
+                           ov_tuple, mods_tuple, prior_peak, goal_weight, goal_bf,
+                           max_weeks, max_phase_weeks, total_weeks,
+                           bf_sd_ui, rate_cv_ui / 100.0)
+oc = envelope["outcome"]
+
+if tl_ci:
+    over_note = ""
+    if tl_ci["p90"] > max_weeks:
+        over_note = (f" Note the high end exceeds your {max_weeks}-week planning "
+                     f"window — slow-response scenarios take longer than the plan "
+                     f"you're looking at, and the CI honestly says so.")
+    frac_note = ""
+    if tl_ci["frac_reached"] < 0.98:
+        frac_note = (f" ({tl_ci['frac_reached']*100:.0f}% of scenarios reach goal "
+                     f"even within the extended {max_weeks + 104}-week horizon; "
+                     f"the rest are slower still.)")
+    st.info(f"⏱️ **Time to goal: {tl_ci['p10']:.0f}–{tl_ci['p90']:.0f} weeks** "
+            f"(80% CI, median {tl_ci['p50']:.0f}). Each scenario re-plans its own "
+            f"optimal schedule for a perturbed start-BF and personal rate response."
+            + over_note + frac_note)
 else:
-    st.info(f"⏱️ **Timeline confidence band: {band_lo}–{band_hi} weeks** "
-            f"(plan re-run at start BF ±2%, the typical DEXA/scale measurement "
-            f"error). BF error mostly cancels for the goal itself but drives the "
-            f"rates — so treat the headline week count as the middle of this "
-            f"range, not a promise."
-            + ("" if all_reached else " ⚠️ At one band edge the plan doesn't fully "
-               "reach goal within max weeks — extend max weeks for a cleaner range."))
+    st.warning("⚠️ Couldn't build a timeline distribution — the goal appears "
+               "unreachable for most simulated scenarios. Check the goal/band "
+               "settings.")
+
+st.markdown(f"**Where you could be at the headline week {total_weeks}** "
+            f"(80% CI across 200 simulated responses to THIS plan):")
+u1, u2 = st.columns(2)
+u1.metric(f"Weight @ wk {total_weeks}",
+          f"{oc['weight_p50']:.1f} lbs",
+          f"{oc['weight_p10']:.1f} – {oc['weight_p90']:.1f} lbs range",
+          delta_color="off")
+u2.metric(f"Body Fat @ wk {total_weeks}",
+          f"{oc['bf_p50']:.1f}%",
+          f"{oc['bf_p10']:.1f} – {oc['bf_p90']:.1f}% range",
+          delta_color="off")
+st.caption("Fast responders flatten out early because the simulation holds at "
+           "goal once reached — so the envelope converges toward the target "
+           "rather than overshooting past it. Shaded bands on the chart below "
+           "show the same envelope week by week.")
 
 # ── Personal calibration status ────────────────────────────────────────────────
 if actuals:
@@ -905,6 +1183,37 @@ plist   = [r["phase"] for r in data]
 fig = make_subplots(rows=2, cols=1,
     subplot_titles=("Scale Weight & Lean Mass (lbs)", "Body Fat %"),
     vertical_spacing=0.12, row_heights=[0.6, 0.4])
+
+# ── 80% CI bands (drawn first so projection lines render on top). The band is
+# allowed to run PAST the deterministic plan end, out to the later of the plan
+# end and the p90 goal-arrival week — slow scenarios don't get visually clipped.
+ew10, ew50, ew90 = envelope["weight"]
+eb10, eb50, eb90 = envelope["bf"]
+band_end = total_weeks
+if tl_ci:
+    band_end = max(band_end, int(math.ceil(tl_ci["p90"])) + 4)
+band_end = min(band_end, len(envelope["weeks"]) - 1)
+band_dates = [start_date + timedelta(weeks=i) for i in range(band_end + 1)]
+
+fig.add_trace(go.Scatter(x=band_dates, y=ew90[:band_end+1], mode="lines",
+    line=dict(width=0), showlegend=False, hoverinfo="skip"), row=1, col=1)
+fig.add_trace(go.Scatter(x=band_dates, y=ew10[:band_end+1], mode="lines",
+    line=dict(width=0), fill="tonexty", fillcolor="rgba(16,185,129,0.13)",
+    name="Weight 80% CI", hoverinfo="skip"), row=1, col=1)
+fig.add_trace(go.Scatter(x=band_dates, y=eb90[:band_end+1], mode="lines",
+    line=dict(width=0), showlegend=False, hoverinfo="skip"), row=2, col=1)
+fig.add_trace(go.Scatter(x=band_dates, y=eb10[:band_end+1], mode="lines",
+    line=dict(width=0), fill="tonexty", fillcolor="rgba(245,158,11,0.13)",
+    name="BF 80% CI", hoverinfo="skip"), row=2, col=1)
+
+if tl_ci:
+    arrival = start_date + timedelta(weeks=tl_ci["p50"])
+    for row in (1, 2):
+        fig.add_vline(x=arrival, line_dash="dashdot",
+                      line_color="rgba(148,163,184,0.55)", row=row, col=1)
+    fig.add_annotation(x=arrival, yref="paper", y=1.06, showarrow=False,
+                       text=f"median goal arrival (wk {tl_ci['p50']:.0f})",
+                       font=dict(size=11, color="#94a3b8"))
 
 fig.add_trace(go.Scatter(x=dates, y=weights, mode="lines+markers", name="Projected Weight",
     line=dict(color="#10b981", width=2.5), marker=dict(size=3),
