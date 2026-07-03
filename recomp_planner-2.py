@@ -4,6 +4,7 @@ from plotly.subplots import make_subplots
 from datetime import date, timedelta
 import pandas as pd
 import math
+import uuid
 
 st.set_page_config(page_title="Recomp Planner", page_icon="💪", layout="wide")
 st.title("💪 Body Recomposition Planner")
@@ -82,10 +83,14 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
     baseline = frame["baseline_lean"]
     height_in = frame["height_in"]
 
-    lean_for_calc = max(current_lean_lbs, peak_lean_lbs) if peak_lean_lbs else current_lean_lbs
+    # Peak lean (muscle memory) governs PROXIMITY — how close you've ever been
+    # to your ceiling. But actual bodyweight-derived numbers (cut rate) use
+    # CURRENT lean, so a detrained user isn't assigned rates for a body they
+    # don't currently have.
+    lean_for_prox = max(current_lean_lbs, peak_lean_lbs) if peak_lean_lbs else current_lean_lbs
 
     rng = max(1e-6, ceiling - baseline)
-    prox = min(1.0, max(0.0, (lean_for_calc - baseline) / rng))
+    prox = min(1.0, max(0.0, (lean_for_prox - baseline) / rng))
 
     # Muscle fraction first — needed to convert lean gain to scale weight
     muscle_frac_bulk = round(0.30 + (1 - prox) ** 1.2 * 0.32, 3)
@@ -105,7 +110,7 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
     cut_pct_wk = 0.1221 * math.exp(0.0940 * current_bf)
     cut_pct_wk = max(0.30, min(1.00, cut_pct_wk))
 
-    approx_weight    = lean_for_calc / (1 - current_bf / 100)
+    approx_weight    = current_lean_lbs / (1 - current_bf / 100)
     cut_rate_weekly  = round(approx_weight * cut_pct_wk / 100, 3)
     cut_rate_monthly = round(cut_rate_weekly * 4.33, 2)
 
@@ -119,7 +124,7 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
                         base_cut_loss + leanness_penalty - prox * 0.03)), 3)
 
     return {
-        "ffmi": round(lean_to_norm_ffmi(lean_for_calc, height_in), 2),
+        "ffmi": round(lean_to_norm_ffmi(lean_for_prox, height_in), 2),
         "ffmi_ceiling": round(frame["ffmi_ceiling"], 2),
         "ceiling_pct": round(prox * 100, 1),
         "bulk_rate_weekly": bulk_rate_weekly,
@@ -134,6 +139,9 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
 # WEEKLY STEP (shared by scheduler + simulation)
 # ══════════════════════════════════════════════════════════════════════════════
 def step_week(w, lean, fat, peak_lean, action, frame, overrides):
+    """Advance one week. Returns the new state plus the rate and muscle
+    fraction ACTUALLY APPLIED for this week's action (0, 0 for maintain),
+    so downstream tables never show a hypothetical bulk rate during a cut."""
     current_bf = fat / w * 100
     dp = dynamic_profile(lean, frame, peak_lean_lbs=peak_lean, current_bf=current_bf)
 
@@ -157,23 +165,33 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides):
         mfrac_cut = max(0.06, min(0.55,
             base + leanness_penalty - dp["ceiling_pct"] / 100 * 0.03))
 
+    applied_rate = 0.0
+    applied_frac = 0.0
+
     if action == "bulk":
         lean += bulk_rate * mfrac_bulk
         fat  += bulk_rate * (1 - mfrac_bulk)
         w    += bulk_rate
+        applied_rate = bulk_rate
+        applied_frac = mfrac_bulk
     elif action == "cut":
-        # Essential-fat floor: a natural lifter cannot cut below ~5% BF. Stop
-        # removing fat once there, so the model can never produce impossible
-        # sub-essential body-fat outcomes.
+        # Essential-fat floor: a natural lifter cannot cut below ~5% BF. When
+        # the floor binds, scale the ENTIRE week's loss (fat AND lean) down
+        # proportionally — otherwise the model would keep stripping lean mass
+        # at full rate while fat holds, simulating impossible pure-muscle loss.
         ESSENTIAL_BF = 5.0
-        min_fat = lean * (ESSENTIAL_BF / 100) / (1 - ESSENTIAL_BF / 100)
-        fat_loss   = cut_rate * (1 - mfrac_cut)
-        lean_loss  = cut_rate * mfrac_cut
-        if fat - fat_loss < min_fat:
-            fat_loss = max(0, fat - min_fat)   # only remove down to the floor
+        min_fat   = lean * (ESSENTIAL_BF / 100) / (1 - ESSENTIAL_BF / 100)
+        fat_loss  = cut_rate * (1 - mfrac_cut)
+        lean_loss = cut_rate * mfrac_cut
+        if fat - fat_loss < min_fat and fat_loss > 0:
+            scale = max(0.0, fat - min_fat) / fat_loss
+            fat_loss  *= scale
+            lean_loss *= scale
         lean -= lean_loss
         fat  -= fat_loss
         w     = lean + fat
+        applied_rate = fat_loss + lean_loss
+        applied_frac = mfrac_cut
     else:  # maintain — true flat hold: composition unchanged for the duration.
         # Used in manual mode to model a known off-plan stretch (vacation, deload,
         # work crunch). The auto-scheduler never generates maintain phases, since
@@ -181,7 +199,7 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides):
         pass
 
     peak_lean = max(peak_lean, lean)
-    return w, lean, fat, peak_lean, bulk_rate, mfrac_bulk, cut_rate, mfrac_cut
+    return w, lean, fat, peak_lean, applied_rate, applied_frac
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SIMULATION (single source of truth)
@@ -195,7 +213,7 @@ def simulate_dynamic(start_weight, start_bf, phases, frame, start_date, override
     rows = [{
         "week": 0, "date": start_date, "phase": "Start", "phase_type": "start",
         "weight": round(w,1), "lean": round(lean,1), "fat": round(fat,1),
-        "bf": round(fat/w*100,1), "change": 0.0, "bulk_rate": 0.0, "muscle_frac": 0.0,
+        "bf": round(fat/w*100,1), "change": 0.0, "rate": 0.0, "muscle_frac": 0.0,
     }]
 
     idx = 1
@@ -205,7 +223,7 @@ def simulate_dynamic(start_weight, start_bf, phases, frame, start_date, override
         n_weeks = phase.get("weeks", 4)
         for _ in range(n_weeks):
             prev_w = w
-            w, lean, fat, peak_lean, br, mfb, cr, mfc = step_week(
+            w, lean, fat, peak_lean, rate, mfrac = step_week(
                 w, lean, fat, peak_lean, ptype, frame, overrides)
             current_date += timedelta(weeks=1)
             rows.append({
@@ -213,7 +231,7 @@ def simulate_dynamic(start_weight, start_bf, phases, frame, start_date, override
                 "phase": phase["name"], "phase_type": ptype,
                 "weight": round(w,1), "lean": round(lean,1), "fat": round(fat,1),
                 "bf": round(fat/w*100,1), "change": round(w-prev_w,3),
-                "bulk_rate": round(br,3), "muscle_frac": round(mfb,3),
+                "rate": round(rate,3), "muscle_frac": round(mfrac,3),
             })
             idx += 1
     return rows
@@ -227,7 +245,7 @@ def _roll_phase(state, action, weeks, frame, overrides):
         w, lean, fat, peak, *_ = step_week(w, lean, fat, peak, action, frame, overrides)
     return (w, lean, fat, peak)
 
-def _goal_distance(state, goal_weight, goal_bf, bf_floor=None):
+def _goal_distance(state, goal_weight, goal_bf):
     w, lean, fat, peak = state
     bf = fat / w * 100
     d = abs(w - goal_weight) + abs(bf - goal_bf)
@@ -256,6 +274,7 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
 
     best_phases   = []
     best_distance = abs(w - goal_weight) + abs(bf_now - goal_bf)
+    just_flipped  = False   # guards the action-flip fallback against ping-ponging
 
     while week_idx < max_weeks:
         bf_now = fat / w * 100
@@ -270,39 +289,57 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
         if hi < lo:
             break
 
-        best = None
-        for this_len in range(lo, hi + 1):
-            s1 = _roll_phase(state, action, this_len, frame, overrides)
-            w1, lean1, fat1, peak1 = s1
-            bf1 = fat1 / w1 * 100
-            if action == "bulk" and bf1 > bf_ceiling + 0.5:
-                break
-            if action == "cut" and bf1 < bf_floor - 0.5:
-                break
+        def _search(lo_try):
+            """Search phase lengths [lo_try, hi] for the current action.
+            Returns (score, length) or None if every length violates a band."""
+            best_local = None
+            for this_len in range(lo_try, hi + 1):
+                s1 = _roll_phase(state, action, this_len, frame, overrides)
+                w1, lean1, fat1, peak1 = s1
+                bf1 = fat1 / w1 * 100
+                if action == "bulk" and bf1 > bf_ceiling + 0.5:
+                    break
+                if action == "cut" and bf1 < bf_floor - 0.5:
+                    break
 
-            next_action = "cut" if action == "bulk" else "bulk"
-            weeks_left2 = weeks_left - this_len
-            hi2 = min(max_phase_weeks, weeks_left2)
-            # Score "stop after this phase" (1-deep) as a valid option, so a
-            # finishing phase that lands on goal isn't penalized by a forced
-            # follow-up phase it doesn't actually need.
-            score_1deep = _goal_distance(s1, goal_weight, goal_bf, bf_floor)
-            if hi2 >= min_phase_weeks:
-                best2 = None
-                for next_len in range(min_phase_weeks, hi2 + 1):
-                    s2 = _roll_phase(s1, next_action, next_len, frame, overrides)
-                    d = _goal_distance(s2, goal_weight, goal_bf, bf_floor)
-                    if best2 is None or d < best2:
-                        best2 = d
-                score = min(score_1deep, best2) if best2 is not None else score_1deep
-            else:
-                score = score_1deep
+                next_action = "cut" if action == "bulk" else "bulk"
+                weeks_left2 = weeks_left - this_len
+                hi2 = min(max_phase_weeks, weeks_left2)
+                # Score "stop after this phase" (1-deep) as a valid option, so a
+                # finishing phase that lands on goal isn't penalized by a forced
+                # follow-up phase it doesn't actually need.
+                score_1deep = _goal_distance(s1, goal_weight, goal_bf)
+                if hi2 >= min_phase_weeks:
+                    best2 = None
+                    for next_len in range(min_phase_weeks, hi2 + 1):
+                        s2 = _roll_phase(s1, next_action, next_len, frame, overrides)
+                        d = _goal_distance(s2, goal_weight, goal_bf)
+                        if best2 is None or d < best2:
+                            best2 = d
+                    score = min(score_1deep, best2) if best2 is not None else score_1deep
+                else:
+                    score = score_1deep
 
-            if best is None or score < best[0]:
-                best = (score, this_len)
+                if best_local is None or score < best_local[0]:
+                    best_local = (score, this_len)
+            return best_local
 
+        best = _search(lo)
+        # Fallback 1: if even the minimum phase length violates a BF band
+        # (e.g. starting just under the ceiling, where a 4-week bulk overshoots),
+        # allow shorter phases down to 1 week.
+        if best is None and lo > 1:
+            best = _search(1)
+        # Fallback 2: if NO length of the current action fits inside the bands,
+        # flip the action once (e.g. open with a short corrective cut instead of
+        # a bulk). Guarded so two impossible actions terminate instead of looping.
         if best is None:
+            if not just_flipped:
+                action = "cut" if action == "bulk" else "bulk"
+                just_flipped = True
+                continue
             break
+        just_flipped = False
 
         chosen_len = best[1]
         new_state = _roll_phase(state, action, chosen_len, frame, overrides)
@@ -441,52 +478,68 @@ auto_phases = cached_schedule(
 # ══════════════════════════════════════════════════════════════════════════════
 # MODE UI
 # ══════════════════════════════════════════════════════════════════════════════
+def _with_ids(phases):
+    """Attach a stable unique id to each phase so widget keys survive
+    insertions/deletions (index-based keys corrupt neighbors on delete)."""
+    return [{**p, "id": uuid.uuid4().hex[:8]} for p in phases]
+
 if mode == "🤖 Auto Schedule":
     st.subheader("🤖 Auto-Generated Schedule")
     st.caption("Phases chosen by 2-phase look-ahead. All numbers below come from "
                "the dynamic simulation.")
+    if not auto_phases:
+        st.error("The scheduler couldn't build a plan inside your BF ceiling/floor "
+                 "band with these inputs. Widen the band or adjust the goal.")
     active_phases = auto_phases
 else:
     st.subheader("🔧 Manual Phase Builder")
-    st.caption("Seeded from the auto schedule when you switch in. Edit freely after.")
+    st.caption("Seeded from the auto schedule when you switch in — switching back "
+               "to Auto and returning will RESET your edits. Edit freely after.")
 
     if "phases" not in st.session_state or st.session_state.get("last_auto") != auto_phases:
         if mode == "🔧 Manual Phases" and st.session_state.get("mode_prev") != mode:
-            st.session_state.phases = [dict(p) for p in auto_phases]
+            st.session_state.phases = _with_ids(auto_phases)
         elif "phases" not in st.session_state:
-            st.session_state.phases = [dict(p) for p in auto_phases]
+            st.session_state.phases = _with_ids(auto_phases)
         st.session_state.last_auto = auto_phases
     st.session_state.mode_prev = mode
 
     phases_to_delete = []
     for i, phase in enumerate(st.session_state.phases):
+        pid = phase["id"]
         c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
         with c1:
             st.session_state.phases[i]["name"] = st.text_input(
-                f"P{i+1}", value=phase["name"], key=f"name_{i}", label_visibility="collapsed")
+                f"P{i+1}", value=phase["name"], key=f"name_{pid}", label_visibility="collapsed")
         with c2:
             st.session_state.phases[i]["type"] = st.selectbox(
                 "Type", ["bulk", "cut", "maintain"],
                 index=["bulk","cut","maintain"].index(phase["type"]),
-                key=f"type_{i}", label_visibility="collapsed")
+                key=f"type_{pid}", label_visibility="collapsed")
         with c3:
             st.session_state.phases[i]["weeks"] = st.number_input(
                 "Weeks", 1, 104, value=phase.get("weeks", 8),
-                key=f"weeks_{i}", label_visibility="collapsed")
+                key=f"weeks_{pid}", label_visibility="collapsed")
         with c4:
-            if st.button("🗑️", key=f"del_{i}"):
+            if st.button("🗑️", key=f"del_{pid}"):
                 phases_to_delete.append(i)
-    for i in sorted(phases_to_delete, reverse=True):
-        st.session_state.phases.pop(i)
+    if phases_to_delete:
+        for i in sorted(phases_to_delete, reverse=True):
+            st.session_state.phases.pop(i)
+        st.rerun()
 
     ca, cr, _ = st.columns([1, 1, 4])
     with ca:
         if st.button("➕ Add Phase"):
-            st.session_state.phases.append({"name": f"Phase {len(st.session_state.phases)+1}", "type": "bulk", "weeks": 8})
+            st.session_state.phases.append({
+                "name": f"Phase {len(st.session_state.phases)+1}",
+                "type": "bulk", "weeks": 8,
+                "id": uuid.uuid4().hex[:8],
+            })
             st.rerun()
     with cr:
         if st.button("↺ Reset to Auto"):
-            st.session_state.phases = [dict(p) for p in auto_phases]
+            st.session_state.phases = _with_ids(auto_phases)
             st.rerun()
 
     active_phases = st.session_state.phases
@@ -584,7 +637,7 @@ fig.update_layout(height=600, paper_bgcolor="#0f1624", plot_bgcolor="#080b14",
     hovermode="x unified", margin=dict(l=10, r=10, t=40, b=10))
 fig.update_xaxes(gridcolor="#1e293b", showgrid=True)
 fig.update_yaxes(gridcolor="#1e293b", showgrid=True)
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TABLE
@@ -595,6 +648,6 @@ with st.expander("Show full table", expanded=False):
     df = pd.DataFrame(data)
     df["date"] = df["date"].astype(str)
     df["change"] = df["change"].apply(lambda x: f"+{x:.2f}" if x > 0 else (f"{x:.2f}" if x != 0 else "—"))
-    df = df[["week","date","phase","weight","lean","fat","bf","change","bulk_rate"]]
-    df.columns = ["Week","Date","Phase","Weight","Lean","Fat","BF%","ΔWt","BulkRate/wk"]
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    df = df[["week","date","phase","weight","lean","fat","bf","change","rate"]]
+    df.columns = ["Week","Date","Phase","Weight","Lean","Fat","BF%","ΔWt","Rate/wk"]
+    st.dataframe(df, width="stretch", hide_index=True)
