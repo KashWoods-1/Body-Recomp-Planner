@@ -396,7 +396,8 @@ def _percentile(sorted_vals, q):
 
 def timeline_ci_full(start_weight, start_bf, goal_weight, goal_bf, bf_ceiling,
                      bf_floor, frame, overrides, mods, prior_peak, max_weeks,
-                     max_phase_weeks, n_samples=24, bf_sd=1.0, rate_cv=0.12, seed=7):
+                     max_phase_weeks, n_samples=24, bf_sd=1.0,
+                     bulk_cv=0.12, cut_cv=0.12, seed=7):
     """Timeline confidence interval done the honest way: each sample RE-OPTIMIZES
     the whole schedule for its perturbed start-BF and rate response, so every
     sample reaches goal on its own optimal path (no tolerance-box artifacts from
@@ -411,8 +412,8 @@ def timeline_ci_full(start_weight, start_bf, goal_weight, goal_bf, bf_ceiling,
     reached_ct = 0
     for _ in range(n_samples):
         sbf = _clamp(rng.gauss(start_bf, bf_sd), 5.0, 40.0)
-        bmul = mods["bulk_mult"] * _clamp(rng.gauss(1.0, rate_cv), 0.45, 1.7)
-        cmul = mods["cut_mult"]  * _clamp(rng.gauss(1.0, rate_cv), 0.45, 1.7)
+        bmul = mods["bulk_mult"] * _clamp(rng.gauss(1.0, bulk_cv), 0.45, 1.7)
+        cmul = mods["cut_mult"]  * _clamp(rng.gauss(1.0, cut_cv), 0.45, 1.7)
         m = {"bulk_mult": bmul, "cut_mult": cmul}
         ph = auto_schedule_dynamic(start_weight, sbf, goal_weight, goal_bf,
                                    bf_ceiling, bf_floor, frame, overrides,
@@ -437,7 +438,7 @@ def timeline_ci_full(start_weight, start_bf, goal_weight, goal_bf, bf_ceiling,
 def monte_carlo_bands(start_weight, start_bf, expected_phases, frame, overrides,
                       mods, prior_peak, goal_weight, goal_bf, max_weeks,
                       max_phase_weeks, headline_week,
-                      n_samples=200, bf_sd=1.0, rate_cv=0.12, seed=42):
+                      n_samples=200, bf_sd=1.0, bulk_cv=0.12, cut_cv=0.12, seed=42):
     """Run n_samples perturbed simulations of the fixed plan. Returns a dict with
     per-week p10/p50/p90 envelopes for weight/BF/lean, the goal-crossing-week
     distribution (timeline CI), and the weight/BF distribution AT headline_week
@@ -459,8 +460,8 @@ def monte_carlo_bands(start_weight, start_bf, expected_phases, frame, overrides,
 
     for _ in range(n_samples):
         sbf = _clamp(rng.gauss(start_bf, bf_sd), 5.0, 40.0)
-        bmul = mods["bulk_mult"] * _clamp(rng.gauss(1.0, rate_cv), 0.45, 1.7)
-        cmul = mods["cut_mult"]  * _clamp(rng.gauss(1.0, rate_cv), 0.45, 1.7)
+        bmul = mods["bulk_mult"] * _clamp(rng.gauss(1.0, bulk_cv), 0.45, 1.7)
+        cmul = mods["cut_mult"]  * _clamp(rng.gauss(1.0, cut_cv), 0.45, 1.7)
         m = {"bulk_mult": bmul, "cut_mult": cmul}
         traj, crossed = _simulate_to_goal(start_weight, sbf, ext, frame, overrides,
                                           m, prior_peak, goal_weight, goal_bf)
@@ -507,7 +508,7 @@ def monte_carlo_bands(start_weight, start_bf, expected_phases, frame, overrides,
         "weeks": list(range(horizon + 1)),
         "weight": (w10, w50, w90), "bf": (b10, b50, b90), "lean": (l10, l50, l90),
         "timeline": timeline, "outcome": outcome,
-        "n_samples": n_samples, "bf_sd": bf_sd, "rate_cv": rate_cv,
+        "n_samples": n_samples, "bf_sd": bf_sd, "bulk_cv": bulk_cv, "cut_cv": cut_cv,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -647,44 +648,85 @@ CALIB_MIN_SAMPLES = 4     # matched weekly deltas per phase type before we trust
 CALIB_CLAMP = (0.4, 2.0)  # sanity bounds on the personal multiplier
 
 def calibrate_from_actuals(actuals, baseline_rows):
-    """Estimate personal rate multipliers from logged weigh-ins.
+    """Estimate personal rate multipliers AND their standard errors from logged
+    weigh-ins.
 
-    actuals       : sorted list of (date, weight)
-    baseline_rows : simulation rows from the UNCALIBRATED model. Calibrating
-                    against an already-calibrated projection would create a
-                    feedback loop, so the reference is always the raw model.
+    Method: within each contiguous run of weigh-ins that falls in a single
+    phase type, regress OBSERVED weight on PROJECTED weight (with intercept).
+    The slope of that line is the personal multiplier for that phase type, and
+    the intercept absorbs the anchor offset. Runs are then pooled by
+    inverse-variance weighting.
 
-    Returns {bulk_mult, cut_mult, bulk_n, cut_n}. Multipliers stay 1.0 until
-    there are >= CALIB_MIN_SAMPLES matched deltas for that phase type.
+    Why levels and not week-to-week deltas: consecutive deltas of noisy
+    weigh-ins have NEGATIVELY CORRELATED errors (the same scale/water error
+    enters one delta with + and the next with -), which both destabilizes a
+    delta-based fit and makes its textbook SE wildly overstated (verified in
+    tests: claimed SE ~3x the true scatter). Level noise is independent
+    across days, so OLS-on-levels gives an honest SE — one that shrinks as
+    you log more data, which is what lets the app narrow the Monte Carlo
+    bands with evidence instead of a guessed CV.
+
+    Returns {bulk_mult, cut_mult, bulk_n, cut_n, bulk_se, cut_se}. Multipliers
+    stay 1.0 (se None) until a phase type has a usable run (>= CALIB_MIN_SAMPLES
+    points spanning a real projected change).
     """
-    out = {"bulk_mult": 1.0, "cut_mult": 1.0, "bulk_n": 0, "cut_n": 0}
+    out = {"bulk_mult": 1.0, "cut_mult": 1.0, "bulk_n": 0, "cut_n": 0,
+           "bulk_se": None, "cut_se": None}
     if len(actuals) < 2 or not baseline_rows:
         return out
 
-    samples = {"bulk": [], "cut": []}
-    for (d0, w0), (d1, w1) in zip(actuals, actuals[1:]):
-        days = (d1 - d0).days
-        if days <= 0 or days > 21:        # gaps > 3 weeks are too noisy to use
+    # 1. Match each weigh-in to its nearest projection row (within 10 days)
+    matched = []   # (date, obs_weight, phase_type, proj_weight)
+    for (d, w) in actuals:
+        nearest = min(baseline_rows, key=lambda r: abs((r["date"] - d).days))
+        if abs((nearest["date"] - d).days) > 10:
             continue
-        obs_wk = (w1 - w0) / (days / 7.0)
-        mid = d0 + timedelta(days=days // 2)
-        nearest = min(baseline_rows, key=lambda r: abs((r["date"] - mid).days))
-        if abs((nearest["date"] - mid).days) > 10:
-            continue
-        pt = nearest["phase_type"]
-        proj_wk = nearest["change"]
-        if pt in samples and abs(proj_wk) > 1e-6:
-            samples[pt].append((obs_wk, proj_wk))
+        if nearest["phase_type"] in ("bulk", "cut"):
+            matched.append((d, w, nearest["phase_type"], nearest["weight"]))
 
+    # 2. Split into contiguous same-phase runs (break on phase change or >21d gap)
+    runs = []
+    cur = []
+    for pt_row in matched:
+        if cur and (pt_row[2] != cur[-1][2] or (pt_row[0] - cur[-1][0]).days > 21):
+            runs.append(cur); cur = []
+        cur.append(pt_row)
+    if cur:
+        runs.append(cur)
+
+    # 3. OLS with intercept per run: obs_w = a + m * proj_w
+    fits = {"bulk": [], "cut": []}   # (m, se, n_points)
+    for run in runs:
+        n = len(run)
+        if n < CALIB_MIN_SAMPLES:
+            continue
+        xs = [r[3] for r in run]; ys = [r[1] for r in run]
+        xbar = sum(xs) / n; ybar = sum(ys) / n
+        sxx = sum((x - xbar) ** 2 for x in xs)
+        if sxx < 0.25:      # projection barely moved in this run; slope is undefined
+            continue
+        sxy = sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys))
+        m = sxy / sxx
+        rss = sum((y - ybar - m * (x - xbar)) ** 2 for x, y in zip(xs, ys))
+        dof = n - 2
+        if dof < 1:
+            continue
+        se = math.sqrt(rss / dof / sxx)
+        if se < 1e-6:
+            se = 1e-6   # perfectly collinear synthetic data; avoid div-by-zero
+        fits[run[0][2]].append((m, se, n))
+
+    # 4. Pool runs per phase type by inverse variance
     for pt in ("bulk", "cut"):
-        n = len(samples[pt])
-        out[f"{pt}_n"] = n
-        if n >= CALIB_MIN_SAMPLES:
-            obs_mean  = sum(o for o, p in samples[pt]) / n
-            proj_mean = sum(p for o, p in samples[pt]) / n
-            ratio = obs_mean / proj_mean   # cut: both negative -> positive ratio
-            if ratio > 0:
-                out[f"{pt}_mult"] = max(CALIB_CLAMP[0], min(CALIB_CLAMP[1], ratio))
+        if not fits[pt]:
+            continue
+        wsum = sum(1.0 / se ** 2 for _, se, _ in fits[pt])
+        m = sum(mm / se ** 2 for mm, se, _ in fits[pt]) / wsum
+        se = math.sqrt(1.0 / wsum)
+        out[f"{pt}_n"] = sum(n for _, _, n in fits[pt])
+        if m > 0:
+            out[f"{pt}_mult"] = max(CALIB_CLAMP[0], min(CALIB_CLAMP[1], m))
+            out[f"{pt}_se"] = se
     return out
 
 def _parse_actuals_df(df):
@@ -929,7 +971,7 @@ def cached_schedule(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw, mp
 
 @st.cache_data(show_spinner="Estimating timeline uncertainty (re-optimizing 24 scenarios)…")
 def cached_timeline_ci(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw, mpw,
-                       mods_tuple, prior_peak, bf_sd, rate_cv):
+                       mods_tuple, prior_peak, bf_sd, bulk_cv, cut_cv):
     """Timeline CI via full re-optimization per sample. The horizon is
     DELIBERATELY extended beyond the user's max-weeks setting (+104 wks) so the
     high end of the CI reflects genuinely slow response scenarios instead of
@@ -938,11 +980,11 @@ def cached_timeline_ci(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw,
     return timeline_ci_full(sw, sbf, gw, gbf, ceil, floor,
                             _frame_from_tuple(frame_tuple), _ov_from_tuple(ov_tuple),
                             _mods_from_tuple(mods_tuple), prior_peak,
-                            horizon, mpw, bf_sd=bf_sd, rate_cv=rate_cv)
+                            horizon, mpw, bf_sd=bf_sd, bulk_cv=bulk_cv, cut_cv=cut_cv)
 
 @st.cache_data(show_spinner="Simulating outcome envelope (200 scenarios)…")
 def cached_envelope(sw, sbf, phases_key, frame_tuple, ov_tuple, mods_tuple,
-                    prior_peak, gw, gbf, mw, mpw, headline, bf_sd, rate_cv):
+                    prior_peak, gw, gbf, mw, mpw, headline, bf_sd, bulk_cv, cut_cv):
     """Per-week p10/p50/p90 envelope from 200 fixed-plan simulations, run out to
     an extended horizon (max weeks + 104) so band edges aren't clipped by the
     planning window either."""
@@ -952,7 +994,7 @@ def cached_envelope(sw, sbf, phases_key, frame_tuple, ov_tuple, mods_tuple,
     return monte_carlo_bands(sw, sbf, phases, _frame_from_tuple(frame_tuple),
                              _ov_from_tuple(ov_tuple), _mods_from_tuple(mods_tuple),
                              prior_peak, gw, gbf, horizon, mpw, headline,
-                             n_samples=200, bf_sd=bf_sd, rate_cv=rate_cv)
+                             n_samples=200, bf_sd=bf_sd, bulk_cv=bulk_cv, cut_cv=cut_cv)
 
 frame_tuple = (frame["height_in"], frame["ceiling_lean"], frame["baseline_lean"],
                frame["ffmi_ceiling"], frame["rate_mult"], frame["allow_recomp"])
@@ -1086,15 +1128,31 @@ with c5:
     st.caption(f"≈ {round(total_weeks/4.33, 1)} months")
 
 # ── Uncertainty: timeline CI + outcome-at-headline CI ─────────────────────────
+# ── Effective per-channel rate CVs: the slider is the PRIOR (belief before
+# data); once calibration is applied and a channel has enough samples, its CV
+# is REPLACED by the measured relative standard error of your multiplier —
+# so logging more weigh-ins genuinely narrows the bands for that channel.
+# Floored at 4% (weekly noise never lets certainty go to zero) and capped at
+# 30% (a terrible early fit shouldn't explode the bands beyond usefulness).
+CV_FLOOR, CV_CAP = 0.04, 0.30
+def _effective_cv(mult, se, n, slider_cv):
+    if apply_calibration and se is not None and n >= CALIB_MIN_SAMPLES and mult > 0:
+        return max(CV_FLOOR, min(CV_CAP, se / mult))
+    return slider_cv
+
+slider_cv = rate_cv_ui / 100.0
+bulk_cv_eff = _effective_cv(calib["bulk_mult"], calib["bulk_se"], calib["bulk_n"], slider_cv)
+cut_cv_eff  = _effective_cv(calib["cut_mult"],  calib["cut_se"],  calib["cut_n"],  slider_cv)
+
 tl_ci = cached_timeline_ci(start_weight, start_bf, goal_weight, goal_bf,
                            bf_ceiling, bf_floor, frame_tuple, ov_tuple,
                            max_weeks, max_phase_weeks, mods_tuple, prior_peak,
-                           bf_sd_ui, rate_cv_ui / 100.0)
+                           bf_sd_ui, bulk_cv_eff, cut_cv_eff)
 phases_key = tuple((p["type"], p.get("weeks", 4)) for p in active_phases)
 envelope = cached_envelope(start_weight, start_bf, phases_key, frame_tuple,
                            ov_tuple, mods_tuple, prior_peak, goal_weight, goal_bf,
                            max_weeks, max_phase_weeks, total_weeks,
-                           bf_sd_ui, rate_cv_ui / 100.0)
+                           bf_sd_ui, bulk_cv_eff, cut_cv_eff)
 oc = envelope["outcome"]
 
 if tl_ci:
@@ -1141,17 +1199,31 @@ if actuals:
     bulk_ready = calib["bulk_n"] >= CALIB_MIN_SAMPLES
     cut_ready  = calib["cut_n"]  >= CALIB_MIN_SAMPLES
     k2.metric("Your bulk rate vs model",
-              f"×{calib['bulk_mult']:.2f}" if bulk_ready else "—",
+              f"×{calib['bulk_mult']:.2f} ± {calib['bulk_se']:.2f}" if bulk_ready and calib['bulk_se'] is not None
+              else ("×%.2f" % calib['bulk_mult'] if bulk_ready else "—"),
               f"{calib['bulk_n']}/{CALIB_MIN_SAMPLES} samples" if not bulk_ready
               else f"{calib['bulk_n']} samples")
     k3.metric("Your cut rate vs model",
-              f"×{calib['cut_mult']:.2f}" if cut_ready else "—",
+              f"×{calib['cut_mult']:.2f} ± {calib['cut_se']:.2f}" if cut_ready and calib['cut_se'] is not None
+              else ("×%.2f" % calib['cut_mult'] if cut_ready else "—"),
               f"{calib['cut_n']}/{CALIB_MIN_SAMPLES} samples" if not cut_ready
               else f"{calib['cut_n']} samples")
     if apply_calibration and (bulk_ready or cut_ready):
-        st.success("✅ Personal calibration is APPLIED to the plan above. "
-                   "Multipliers are measured against the raw (uncalibrated) model, "
-                   "so they stay stable instead of chasing their own output.")
+        parts = []
+        if bulk_ready and calib["bulk_se"] is not None:
+            parts.append(f"bulk ±{bulk_cv_eff*100:.0f}% (measured)")
+        else:
+            parts.append(f"bulk ±{bulk_cv_eff*100:.0f}% (slider)")
+        if cut_ready and calib["cut_se"] is not None:
+            parts.append(f"cut ±{cut_cv_eff*100:.0f}% (measured)")
+        else:
+            parts.append(f"cut ±{cut_cv_eff*100:.0f}% (slider)")
+        st.success("✅ Personal calibration is APPLIED. Band width now uses your "
+                   f"MEASURED uncertainty where available — {', '.join(parts)}. "
+                   "Multipliers are fit against the raw (uncalibrated) model via "
+                   "regression, so they stay stable instead of chasing their own "
+                   "output; the ± shrinks as you log more weigh-ins, which is "
+                   "what narrows the bands.")
     elif apply_calibration:
         st.warning(f"Calibration is on but needs ≥{CALIB_MIN_SAMPLES} matched weekly "
                    f"deltas per phase type before it changes anything. Keep logging.")
