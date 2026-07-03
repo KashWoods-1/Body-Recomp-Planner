@@ -5,10 +5,12 @@ from datetime import date, timedelta
 import pandas as pd
 import math
 import uuid
+import io
 
 st.set_page_config(page_title="Recomp Planner", page_icon="💪", layout="wide")
 st.title("💪 Body Recomposition Planner")
-st.caption("Dynamic model — personalized ceiling from frame, rates degrade as you approach it.")
+st.caption("Dynamic model — personalized ceiling from frame, rates degrade as you approach it. "
+           "Log real weigh-ins to calibrate the model to YOUR response instead of population averages.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FRAME ENGINE (Casey Butt ceiling + frame-scaled baseline)
@@ -24,6 +26,18 @@ DEFAULT_BASELINE_K = 0.651
 # from years ago is the least reliable input in the whole model.
 STARTING_STATS_SMOOTHING = 0.6
 
+# ── Sex adjustments (distribution-level, honest caveat: the Casey Butt formula
+# was derived from male drug-free champions; these ratios adapt its OUTPUT to
+# female population data rather than re-deriving the formula) ──────────────────
+FEMALE_CEILING_MULT   = 0.86   # female genetic lean ceiling ≈ 86% of male, same frame
+FEMALE_BASELINE_RATIO = 0.81   # female untrained lean ≈ 81% of male untrained lean
+FEMALE_RATE_MULT      = 0.50   # absolute lean gain rate ≈ half of male
+
+# ── Muscle memory: bounded rebuild bonus when current lean sits below a prior
+# peak. Max +50% to the lean gain rate at maximum deficit, decaying linearly to
+# zero AT the prior peak. Past the peak, normal first-time rates apply. ────────
+MM_MAX_BONUS = 0.50
+
 def casey_butt_ceiling_lean(height_in, wrist_in, ankle_in, bf=10):
     """Max drug-free lean body mass. Verified vs Butt's worked example
     (69in, 7.0, 8.7, 10%bf -> 173.7 lbs)."""
@@ -38,19 +52,30 @@ def lean_to_norm_ffmi(lean_lbs, height_in):
     hm = _height_m(height_in)
     return (lean_lbs * 0.453592) / (hm ** 2) + 6.1 * (1.8 - hm)
 
-def build_frame(height_in, wrist_in, ankle_in, age,
+def build_frame(height_in, wrist_in, ankle_in, age, sex="Male",
                 start_lean=None, start_lean_weight=None):
     """Compute the personalized ceiling + baseline once.
 
-    ceiling_lean : Casey Butt max lean (age-adjusted)
+    ceiling_lean : Casey Butt max lean (age- and sex-adjusted)
     baseline_lean: untrained floor, frame-scaled. Default = K * ceiling.
                    If the user supplies real starting stats, blend their implied
                    untrained lean toward that default (heavy smoothing + clamp).
+    rate_mult    : sex multiplier on the lean gain rate curve.
     """
     ceiling = casey_butt_ceiling_lean(height_in, wrist_in, ankle_in, bf=10)
     ceiling *= 1 - max(0, (age - 40) * 0.005)   # mild age tax on the ceiling
 
-    default_baseline = DEFAULT_BASELINE_K * ceiling
+    baseline_k = DEFAULT_BASELINE_K
+    rate_mult  = 1.0
+    if sex == "Female":
+        ceiling *= FEMALE_CEILING_MULT
+        # Female baseline should land at 0.81x the male untrained lean. Since the
+        # ceiling was already scaled by 0.86, the K applied to the FEMALE ceiling
+        # is 0.651 * (0.81 / 0.86).
+        baseline_k = DEFAULT_BASELINE_K * (FEMALE_BASELINE_RATIO / FEMALE_CEILING_MULT)
+        rate_mult  = FEMALE_RATE_MULT
+
+    default_baseline = baseline_k * ceiling
 
     baseline = default_baseline
     if start_lean_weight is not None and start_lean is not None and start_lean > 0:
@@ -67,6 +92,7 @@ def build_frame(height_in, wrist_in, ankle_in, age,
         "ceiling_lean": ceiling,
         "baseline_lean": baseline,
         "ffmi_ceiling": lean_to_norm_ffmi(ceiling, height_in),
+        "rate_mult": rate_mult,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,6 +103,21 @@ def build_frame(height_in, wrist_in, ankle_in, age,
 # (year1 +20, year2 +10, year3 +5, year4 +2.5 lbs lean from untrained).
 CURVE_MAXRATE_YR = 20.2   # lbs/yr at zero proximity
 CURVE_K          = 1.8    # decay exponent
+
+def muscle_frac_cut_model(cut_pct_wk, current_bf, prox):
+    """Share of each lost pound that is lean, as one shared function so the
+    profile display and the weekly step can never drift apart.
+
+    Anchors (Helms/Garthe): 0.5%/wk ~10%, 1.0%/wk ~20%, 1.4%/wk ~30%.
+    Leanness penalty uses softplus (smooth max) so there's no kink at 15% BF.
+    Recomp term (Garthe): very slow cuts (<0.55%/wk) far from the ceiling can
+    show slight lean GAIN — the fraction may go mildly negative, floored at -10%.
+    The (1-prox)^2 factor kills the effect for advanced lifters.
+    """
+    base             = 0.05 + (cut_pct_wk ** 1.5) * 0.16
+    leanness_penalty = 0.012 * 0.5 * math.log1p(math.exp(2.0 * (15 - current_bf)))
+    recomp           = -((1 - prox) ** 2) * max(0.0, 0.55 - cut_pct_wk) * 0.35
+    return max(-0.10, min(0.55, base + leanness_penalty + recomp - prox * 0.03))
 
 def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0):
     ceiling  = frame["ceiling_lean"]
@@ -96,9 +137,16 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
     muscle_frac_bulk = round(0.30 + (1 - prox) ** 1.2 * 0.32, 3)
     muscle_frac_bulk = max(0.30, min(0.60, muscle_frac_bulk))
 
-    # Curve gives LEAN gain per year (calibrated to the 20/10/5/2 lean schedule).
+    # Curve gives LEAN gain per year (calibrated to the 20/10/5/2 lean schedule),
+    # scaled by sex. Because prox uses PEAK lean, a detrained lifter gets the
+    # slower near-peak rate — the muscle-memory bonus below then reflects that
+    # rebuilding lost tissue is empirically faster than first-time gain.
+    lean_rate_yr = CURVE_MAXRATE_YR * frame.get("rate_mult", 1.0) * (1 - prox) ** CURVE_K
+    if peak_lean_lbs and peak_lean_lbs > current_lean_lbs:
+        deficit = (peak_lean_lbs - current_lean_lbs) / max(1e-6, peak_lean_lbs - baseline)
+        lean_rate_yr *= 1.0 + MM_MAX_BONUS * min(1.0, max(0.0, deficit))
+
     # Scale-weight bulk rate = lean rate / muscle fraction, since fat rides along.
-    lean_rate_yr      = CURVE_MAXRATE_YR * (1 - prox) ** CURVE_K
     bulk_rate_yr      = lean_rate_yr / muscle_frac_bulk
     bulk_rate_weekly  = round(bulk_rate_yr / 52.0, 3)
     bulk_rate_monthly = round(bulk_rate_yr / 12.0, 2)
@@ -114,14 +162,7 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
     cut_rate_weekly  = round(approx_weight * cut_pct_wk / 100, 3)
     cut_rate_monthly = round(cut_rate_weekly * 4.33, 2)
 
-    # Lean-loss fraction: keyed off cut rate as % of bodyweight/wk (scale-invariant),
-    # rising with aggressiveness and at low body fat. Advanced lifters retain better.
-    # Anchors (Helms/Garthe): 0.5%/wk ~10%, 1.0%/wk ~20%, 1.4%/wk ~30%.
-    # Leanness penalty uses softplus (smooth max) so there's no kink at 15% BF.
-    base_cut_loss    = 0.05 + (cut_pct_wk ** 1.5) * 0.16
-    leanness_penalty = 0.012 * 0.5 * math.log1p(math.exp(2.0 * (15 - current_bf)))
-    muscle_frac_cut  = round(max(0.06, min(0.55,
-                        base_cut_loss + leanness_penalty - prox * 0.03)), 3)
+    muscle_frac_cut = round(muscle_frac_cut_model(cut_pct_wk, current_bf, prox), 3)
 
     return {
         "ffmi": round(lean_to_norm_ffmi(lean_for_prox, height_in), 2),
@@ -138,15 +179,26 @@ def dynamic_profile(current_lean_lbs, frame, peak_lean_lbs=None, current_bf=15.0
 # ══════════════════════════════════════════════════════════════════════════════
 # WEEKLY STEP (shared by scheduler + simulation)
 # ══════════════════════════════════════════════════════════════════════════════
-def step_week(w, lean, fat, peak_lean, action, frame, overrides):
+DEFAULT_MODS = {"bulk_mult": 1.0, "cut_mult": 1.0}
+
+def step_week(w, lean, fat, peak_lean, action, frame, overrides, mods=None):
     """Advance one week. Returns the new state plus the rate and muscle
     fraction ACTUALLY APPLIED for this week's action (0, 0 for maintain),
-    so downstream tables never show a hypothetical bulk rate during a cut."""
+    so downstream tables never show a hypothetical bulk rate during a cut.
+
+    mods: multipliers on the DYNAMIC rates (consistency + personal calibration).
+    Explicit rate overrides are taken literally and NOT scaled — if the user
+    forces a rate, we assume that's the rate they actually achieve.
+    """
+    if mods is None:
+        mods = DEFAULT_MODS
     current_bf = fat / w * 100
     dp = dynamic_profile(lean, frame, peak_lean_lbs=peak_lean, current_bf=current_bf)
 
-    bulk_rate = overrides["bulk_rate"] if overrides["bulk_rate"] > 0 else dp["bulk_rate_weekly"]
-    cut_rate  = overrides["cut_rate"]  if overrides["cut_rate"]  > 0 else dp["cut_rate_weekly"]
+    bulk_rate = (overrides["bulk_rate"] if overrides["bulk_rate"] > 0
+                 else dp["bulk_rate_weekly"] * mods["bulk_mult"])
+    cut_rate  = (overrides["cut_rate"] if overrides["cut_rate"] > 0
+                 else dp["cut_rate_weekly"] * mods["cut_mult"])
 
     if overrides["bulk_muscle"] > 0:
         mfrac_bulk = overrides["bulk_muscle"] / 100
@@ -160,10 +212,8 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides):
         # cut rate in use back to % of bodyweight/wk so the lean-loss curve is
         # on the same scale whether the rate is dynamic or overridden.
         cut_pct_wk_eff = cut_rate / w * 100
-        base = 0.05 + (cut_pct_wk_eff ** 1.5) * 0.16
-        leanness_penalty = 0.012 * 0.5 * math.log1p(math.exp(2.0 * (15 - current_bf)))
-        mfrac_cut = max(0.06, min(0.55,
-            base + leanness_penalty - dp["ceiling_pct"] / 100 * 0.03))
+        mfrac_cut = muscle_frac_cut_model(cut_pct_wk_eff, current_bf,
+                                          dp["ceiling_pct"] / 100)
 
     applied_rate = 0.0
     applied_frac = 0.0
@@ -179,6 +229,8 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides):
         # the floor binds, scale the ENTIRE week's loss (fat AND lean) down
         # proportionally — otherwise the model would keep stripping lean mass
         # at full rate while fat holds, simulating impossible pure-muscle loss.
+        # Note mfrac_cut may be slightly NEGATIVE (slow-cut recomp): the week
+        # then loses a bit more fat than the cut rate and gains a sliver of lean.
         ESSENTIAL_BF = 5.0
         min_fat   = lean * (ESSENTIAL_BF / 100) / (1 - ESSENTIAL_BF / 100)
         fat_loss  = cut_rate * (1 - mfrac_cut)
@@ -204,11 +256,12 @@ def step_week(w, lean, fat, peak_lean, action, frame, overrides):
 # ══════════════════════════════════════════════════════════════════════════════
 # SIMULATION (single source of truth)
 # ══════════════════════════════════════════════════════════════════════════════
-def simulate_dynamic(start_weight, start_bf, phases, frame, start_date, overrides):
+def simulate_dynamic(start_weight, start_bf, phases, frame, start_date, overrides,
+                     mods=None, prior_peak=None):
     w    = start_weight
     lean = start_weight * (1 - start_bf / 100)
     fat  = start_weight * (start_bf / 100)
-    peak_lean = lean
+    peak_lean = max(lean, prior_peak) if prior_peak else lean
 
     rows = [{
         "week": 0, "date": start_date, "phase": "Start", "phase_type": "start",
@@ -224,7 +277,7 @@ def simulate_dynamic(start_weight, start_bf, phases, frame, start_date, override
         for _ in range(n_weeks):
             prev_w = w
             w, lean, fat, peak_lean, rate, mfrac = step_week(
-                w, lean, fat, peak_lean, ptype, frame, overrides)
+                w, lean, fat, peak_lean, ptype, frame, overrides, mods)
             current_date += timedelta(weeks=1)
             rows.append({
                 "week": idx, "date": current_date,
@@ -239,10 +292,11 @@ def simulate_dynamic(start_weight, start_bf, phases, frame, start_date, override
 # ══════════════════════════════════════════════════════════════════════════════
 # DYNAMIC LOOK-AHEAD SCHEDULER
 # ══════════════════════════════════════════════════════════════════════════════
-def _roll_phase(state, action, weeks, frame, overrides):
+def _roll_phase(state, action, weeks, frame, overrides, mods=None):
     w, lean, fat, peak = state
     for _ in range(weeks):
-        w, lean, fat, peak, *_ = step_week(w, lean, fat, peak, action, frame, overrides)
+        w, lean, fat, peak, *_ = step_week(w, lean, fat, peak, action, frame,
+                                           overrides, mods)
     return (w, lean, fat, peak)
 
 def _goal_distance(state, goal_weight, goal_bf):
@@ -259,11 +313,12 @@ def _goal_distance(state, goal_weight, goal_bf):
 
 def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
                           bf_ceiling, bf_floor, frame, overrides,
-                          max_weeks=156, max_phase_weeks=20, min_phase_weeks=4):
+                          max_weeks=156, max_phase_weeks=20, min_phase_weeks=4,
+                          mods=None, prior_peak=None):
     w    = start_weight
     lean = start_weight * (1 - start_bf / 100)
     fat  = start_weight * (start_bf / 100)
-    peak = lean
+    peak = max(lean, prior_peak) if prior_peak else lean
 
     phases = []
     week_idx = 0
@@ -294,7 +349,7 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
             Returns (score, length) or None if every length violates a band."""
             best_local = None
             for this_len in range(lo_try, hi + 1):
-                s1 = _roll_phase(state, action, this_len, frame, overrides)
+                s1 = _roll_phase(state, action, this_len, frame, overrides, mods)
                 w1, lean1, fat1, peak1 = s1
                 bf1 = fat1 / w1 * 100
                 if action == "bulk" and bf1 > bf_ceiling + 0.5:
@@ -312,7 +367,8 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
                 if hi2 >= min_phase_weeks:
                     best2 = None
                     for next_len in range(min_phase_weeks, hi2 + 1):
-                        s2 = _roll_phase(s1, next_action, next_len, frame, overrides)
+                        s2 = _roll_phase(s1, next_action, next_len, frame,
+                                         overrides, mods)
                         d = _goal_distance(s2, goal_weight, goal_bf)
                         if best2 is None or d < best2:
                             best2 = d
@@ -342,7 +398,7 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
         just_flipped = False
 
         chosen_len = best[1]
-        new_state = _roll_phase(state, action, chosen_len, frame, overrides)
+        new_state = _roll_phase(state, action, chosen_len, frame, overrides, mods)
         w, lean, fat, peak = new_state
         phases.append({
             "name": f"{'Bulk' if action=='bulk' else 'Cut'} {phase_num}",
@@ -364,6 +420,72 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
     return best_phases if best_phases else phases
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PERSONAL CALIBRATION (actuals vs baseline projection)
+# ══════════════════════════════════════════════════════════════════════════════
+CALIB_MIN_SAMPLES = 4     # matched weekly deltas per phase type before we trust it
+CALIB_CLAMP = (0.4, 2.0)  # sanity bounds on the personal multiplier
+
+def calibrate_from_actuals(actuals, baseline_rows):
+    """Estimate personal rate multipliers from logged weigh-ins.
+
+    actuals       : sorted list of (date, weight)
+    baseline_rows : simulation rows from the UNCALIBRATED model. Calibrating
+                    against an already-calibrated projection would create a
+                    feedback loop, so the reference is always the raw model.
+
+    Returns {bulk_mult, cut_mult, bulk_n, cut_n}. Multipliers stay 1.0 until
+    there are >= CALIB_MIN_SAMPLES matched deltas for that phase type.
+    """
+    out = {"bulk_mult": 1.0, "cut_mult": 1.0, "bulk_n": 0, "cut_n": 0}
+    if len(actuals) < 2 or not baseline_rows:
+        return out
+
+    samples = {"bulk": [], "cut": []}
+    for (d0, w0), (d1, w1) in zip(actuals, actuals[1:]):
+        days = (d1 - d0).days
+        if days <= 0 or days > 21:        # gaps > 3 weeks are too noisy to use
+            continue
+        obs_wk = (w1 - w0) / (days / 7.0)
+        mid = d0 + timedelta(days=days // 2)
+        nearest = min(baseline_rows, key=lambda r: abs((r["date"] - mid).days))
+        if abs((nearest["date"] - mid).days) > 10:
+            continue
+        pt = nearest["phase_type"]
+        proj_wk = nearest["change"]
+        if pt in samples and abs(proj_wk) > 1e-6:
+            samples[pt].append((obs_wk, proj_wk))
+
+    for pt in ("bulk", "cut"):
+        n = len(samples[pt])
+        out[f"{pt}_n"] = n
+        if n >= CALIB_MIN_SAMPLES:
+            obs_mean  = sum(o for o, p in samples[pt]) / n
+            proj_mean = sum(p for o, p in samples[pt]) / n
+            ratio = obs_mean / proj_mean   # cut: both negative -> positive ratio
+            if ratio > 0:
+                out[f"{pt}_mult"] = max(CALIB_CLAMP[0], min(CALIB_CLAMP[1], ratio))
+    return out
+
+def _parse_actuals_df(df):
+    """DataFrame (date, weight) -> clean sorted list of (date, float) tuples."""
+    if df is None or df.empty:
+        return []
+    out = []
+    for _, row in df.iterrows():
+        d, w = row.get("date"), row.get("weight")
+        if pd.isna(d) or pd.isna(w):
+            continue
+        d = pd.to_datetime(d).date()
+        try:
+            w = float(w)
+        except (TypeError, ValueError):
+            continue
+        if 50 <= w <= 500:
+            out.append((d, w))
+    out.sort(key=lambda t: t[0])
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
@@ -373,20 +495,32 @@ with st.sidebar:
 
     st.divider()
     st.header("👤 Profile")
+    sex           = st.radio("Sex", ["Male", "Female"], horizontal=True,
+                             help="Distribution-level adjustment: female ceiling "
+                                  "≈86% of male for the same frame, untrained "
+                                  "baseline ≈81%, gain rate ≈half. The underlying "
+                                  "Casey Butt formula was derived from male "
+                                  "lifters; these ratios adapt its output.")
     height_ft     = st.number_input("Height (ft)", 4, 7, 5)
     height_in_rem = st.number_input("Height (in)", 0, 11, 8)
     wrist_in      = st.number_input("Wrist circumference (in)", 4.0, 10.0, 6.25, 0.25)
     ankle_in      = st.number_input("Ankle circumference (in)", 6.0, 14.0, 8.0, 0.25)
     age           = st.number_input("Age", 16, 80, 22)
 
-    # ── optional: starting-lifting stats (collapsed) ───────────────────────────
-    with st.expander("📦 Starting-lifting stats (optional)", expanded=False):
+    # ── optional: history (collapsed) ──────────────────────────────────────────
+    with st.expander("📦 Training history (optional)", expanded=False):
         st.caption("Roughly what you weighed and your BF% when you FIRST started "
                    "lifting. Used to personalize your untrained baseline. Heavily "
                    "smoothed toward the frame default, since old-memory BF is noisy. "
                    "Leave at 0 to use the frame default.")
         first_weight = st.number_input("Starting weight when you began (lbs)", 0.0, 300.0, 0.0, 1.0)
         first_bf     = st.number_input("Starting BF% when you began", 0.0, 40.0, 0.0, 0.5)
+        st.caption("If you were once MORE muscular than today, enter your highest "
+                   "ever lean mass. Rebuilding lost muscle is faster than gaining "
+                   "it the first time — the model applies a bounded rebuild bonus "
+                   "(up to +50% rate) that decays to zero at your prior peak.")
+        prior_peak_in = st.number_input("Highest lean mass ever held (lbs, 0 = skip)",
+                                        0.0, 250.0, 0.0, 0.5)
 
     st.divider()
     st.header("🎯 Goal")
@@ -394,6 +528,15 @@ with st.sidebar:
     goal_bf     = st.number_input("Goal Body Fat %",   5.0, 40.0, 15.0, 0.5)
     bf_ceiling  = st.number_input("Max BF% (ceiling)", 8.0, 35.0, 17.0, 0.5)
     bf_floor    = st.number_input("Min BF% (floor)",   4.0, 25.0, 14.5, 0.5)
+
+    st.divider()
+    st.header("📊 Adherence")
+    consistency = st.slider("Consistency (% of days on plan)", 50, 100, 100, 5,
+        help="Deterministic haircut on your rates. Bulk rate scales linearly "
+             "with adherence (missed surplus days just slow gain). Cut rate is "
+             "penalized HARDER (1.6a - 0.6): off-plan days on a cut usually mean "
+             "eating over maintenance, which erases deficit disproportionately. "
+             "At 100% this has no effect.")
 
     st.divider()
     st.header("⚙️ Mode")
@@ -405,19 +548,22 @@ with st.sidebar:
     if first_weight > 0 and first_bf > 0:
         start_lean_from_first = first_weight * (1 - first_bf / 100)
 
-    frame = build_frame(height_in_total, wrist_in, ankle_in, age,
+    frame = build_frame(height_in_total, wrist_in, ankle_in, age, sex=sex,
                         start_lean=start_lean_from_first,
                         start_lean_weight=first_weight if first_weight > 0 else None)
 
+    prior_peak = prior_peak_in if prior_peak_in > 0 else None
     start_lean = start_weight * (1 - start_bf / 100)
-    dp_start = dynamic_profile(start_lean, frame, current_bf=start_bf)
+    dp_start = dynamic_profile(start_lean, frame, peak_lean_lbs=prior_peak,
+                               current_bf=start_bf)
 
     st.divider()
     st.header("📐 Your Profile (starting)")
     st.caption("Rates degrade over the plan as you approach your ceiling.")
     st.metric("FFMI", f"{dp_start['ffmi']}")
     st.metric("Ceiling (lean lbs)", f"{frame['ceiling_lean']:.0f}",
-              help=f"Casey Butt max, normalized FFMI {frame['ffmi_ceiling']:.1f}")
+              help=f"Casey Butt max ({sex.lower()}-adjusted), "
+                   f"normalized FFMI {frame['ffmi_ceiling']:.1f}")
     st.metric("Baseline (untrained lbs)", f"{frame['baseline_lean']:.0f}")
     st.metric("% to Ceiling", f"{dp_start['ceiling_pct']}%")
     st.metric("Start Bulk Rate",
@@ -429,7 +575,10 @@ with st.sidebar:
                    "this sits at the conservative end and rises slightly as you advance.")
     st.metric("Start Muscle Loss % (Cut)", f"{dp_start['muscle_frac_cut']*100:.0f}%",
               help="Share of each lost pound that is lean. Scales with cut "
-                   "aggressiveness, per Helms/Garthe: faster cuts lose more muscle.")
+                   "aggressiveness, per Helms/Garthe: faster cuts lose more muscle. "
+                   "A NEGATIVE value means a very slow cut is projected to add a "
+                   "sliver of lean while losing fat (Garthe recomp effect — "
+                   "novices and returning lifters only).")
 
     st.divider()
     st.header("📅 Schedule Length")
@@ -439,7 +588,9 @@ with st.sidebar:
 
     # ── optional: manual overrides (collapsed) ─────────────────────────────────
     with st.expander("⚙️ Rate overrides (optional)", expanded=False):
-        st.caption("Force specific rates/ratios. Leave at 0 to use dynamic values.")
+        st.caption("Force specific rates/ratios. Leave at 0 to use dynamic values. "
+                   "Forced rates are taken literally — consistency and personal "
+                   "calibration do NOT scale them.")
         bulk_rate_override   = st.number_input("Bulk rate (lbs/week)", 0.0, 2.0, 0.0, 0.05)
         cut_rate_override    = st.number_input("Cut rate (lbs/week)",  0.0, 2.0, 0.0, 0.05)
         bulk_muscle_override = st.number_input("Muscle % on bulk", 0, 100, 0, 1)
@@ -449,6 +600,57 @@ with st.sidebar:
     with st.expander("🗓️ Start date (optional)", expanded=False):
         start_date = st.date_input("Start date", value=date(2026, 6, 13))
 
+    # ── actuals log (feeds personal calibration + chart overlay) ───────────────
+    with st.expander("📉 Log actuals (weekly weigh-ins)", expanded=False):
+        st.caption("Log real weigh-ins (or import a CSV with `date,weight` columns "
+                   "— MacroFactor exports work). Data lives in this browser "
+                   "session only; use Download to keep it between sessions.")
+        up = st.file_uploader("Import CSV", type="csv", key="actuals_csv")
+        if up is not None and st.session_state.get("actuals_csv_name") != up.name:
+            try:
+                raw = pd.read_csv(up)
+                raw.columns = [c.strip().lower() for c in raw.columns]
+                if "date" in raw.columns and "weight" in raw.columns:
+                    imp = raw[["date", "weight"]].copy()
+                    imp["date"] = pd.to_datetime(imp["date"], errors="coerce")
+                    imp["weight"] = pd.to_numeric(imp["weight"], errors="coerce")
+                    imp = imp.dropna()
+                    st.session_state.actuals_df = imp
+                    st.session_state.actuals_csv_name = up.name
+                else:
+                    st.error("CSV needs `date` and `weight` columns.")
+            except Exception as e:
+                st.error(f"Couldn't parse CSV: {e}")
+
+        if "actuals_df" not in st.session_state:
+            st.session_state.actuals_df = pd.DataFrame(
+                {"date": pd.Series(dtype="datetime64[ns]"),
+                 "weight": pd.Series(dtype="float")})
+
+        edited_actuals = st.data_editor(
+            st.session_state.actuals_df,
+            num_rows="dynamic", hide_index=True, key="actuals_editor",
+            column_config={
+                "date": st.column_config.DateColumn("Date"),
+                "weight": st.column_config.NumberColumn("Weight (lbs)",
+                                                        min_value=50.0, max_value=500.0,
+                                                        step=0.1, format="%.1f"),
+            })
+        st.session_state.actuals_df = edited_actuals
+
+        actuals = _parse_actuals_df(edited_actuals)
+        if actuals:
+            csv_buf = io.StringIO()
+            pd.DataFrame(actuals, columns=["date", "weight"]).to_csv(csv_buf, index=False)
+            st.download_button("⬇️ Download actuals CSV", csv_buf.getvalue(),
+                               "actuals.csv", "text/csv")
+        apply_calibration = st.checkbox(
+            "Apply personal calibration", value=False,
+            help=f"Recalibrates bulk/cut rates from the gap between your logged "
+                 f"weigh-ins and the raw model. Needs at least {CALIB_MIN_SAMPLES} "
+                 f"matched weekly deltas per phase type; multipliers are clamped "
+                 f"to {CALIB_CLAMP[0]}–{CALIB_CLAMP[1]}x.")
+
 overrides = {
     "bulk_rate":   bulk_rate_override,
     "cut_rate":    cut_rate_override,
@@ -457,23 +659,78 @@ overrides = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCHEDULE (cached)
+# SCHEDULE + BAND (cached)
 # ══════════════════════════════════════════════════════════════════════════════
+def _frame_from_tuple(t):
+    return {"height_in": t[0], "ceiling_lean": t[1], "baseline_lean": t[2],
+            "ffmi_ceiling": t[3], "rate_mult": t[4]}
+
+def _ov_from_tuple(t):
+    return {"bulk_rate": t[0], "cut_rate": t[1], "bulk_muscle": t[2], "cut_muscle": t[3]}
+
+def _mods_from_tuple(t):
+    return {"bulk_mult": t[0], "cut_mult": t[1]}
+
 @st.cache_data(show_spinner="Optimizing schedule…")
-def cached_schedule(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw, mpw):
-    frame_d = {"height_in": frame_tuple[0], "ceiling_lean": frame_tuple[1],
-               "baseline_lean": frame_tuple[2], "ffmi_ceiling": frame_tuple[3]}
-    ov = {"bulk_rate": ov_tuple[0], "cut_rate": ov_tuple[1],
-          "bulk_muscle": ov_tuple[2], "cut_muscle": ov_tuple[3]}
-    return auto_schedule_dynamic(sw, sbf, gw, gbf, ceil, floor, frame_d, ov,
-                                 max_weeks=mw, max_phase_weeks=mpw)
+def cached_schedule(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw, mpw,
+                    mods_tuple, prior_peak):
+    return auto_schedule_dynamic(
+        sw, sbf, gw, gbf, ceil, floor,
+        _frame_from_tuple(frame_tuple), _ov_from_tuple(ov_tuple),
+        max_weeks=mw, max_phase_weeks=mpw,
+        mods=_mods_from_tuple(mods_tuple), prior_peak=prior_peak)
+
+@st.cache_data(show_spinner="Computing timeline confidence band…")
+def cached_band(sw, sbf, gw, gbf, ceil, floor, frame_tuple, ov_tuple, mw, mpw,
+                mods_tuple, prior_peak):
+    """Run the full plan at start-BF -2 / base / +2 to turn BF measurement error
+    into a WEEKS range. BF error mostly cancels for the goal itself but drives
+    the rates, so this is timeline uncertainty, not goal uncertainty. The band
+    is naturally tighter for novices (fast, robust rates) and wider near the
+    ceiling (slow rates amplify any input error)."""
+    frame_d = _frame_from_tuple(frame_tuple)
+    ov      = _ov_from_tuple(ov_tuple)
+    mods    = _mods_from_tuple(mods_tuple)
+    out = []
+    for dbf in (-2.0, 0.0, 2.0):
+        sbf_v = min(40.0, max(5.0, sbf + dbf))
+        ph = auto_schedule_dynamic(sw, sbf_v, gw, gbf, ceil, floor, frame_d, ov,
+                                   max_weeks=mw, max_phase_weeks=mpw,
+                                   mods=mods, prior_peak=prior_peak)
+        rows = simulate_dynamic(sw, sbf_v, ph, frame_d, date(2000, 1, 3), ov,
+                                mods=mods, prior_peak=prior_peak)
+        f = rows[-1]
+        reached = abs(f["weight"] - gw) <= 2 and abs(f["bf"] - gbf) <= 1.5
+        out.append({"dbf": dbf, "weeks": f["week"], "reached": reached})
+    return out
+
+frame_tuple = (frame["height_in"], frame["ceiling_lean"], frame["baseline_lean"],
+               frame["ffmi_ceiling"], frame["rate_mult"])
+ov_tuple = (bulk_rate_override, cut_rate_override, bulk_muscle_override, cut_muscle_override)
+
+# ── Baseline (uncalibrated, 100%-consistency) projection: the fixed reference
+# that personal calibration measures against ──────────────────────────────────
+baseline_phases = cached_schedule(start_weight, start_bf, goal_weight, goal_bf,
+                                  bf_ceiling, bf_floor, frame_tuple, ov_tuple,
+                                  max_weeks, max_phase_weeks, (1.0, 1.0), prior_peak)
+baseline_rows = simulate_dynamic(start_weight, start_bf, baseline_phases, frame,
+                                 start_date, overrides, mods=DEFAULT_MODS,
+                                 prior_peak=prior_peak)
+
+calib = calibrate_from_actuals(actuals, baseline_rows)
+
+# ── Assemble effective modifiers: consistency x personal calibration ──────────
+a = consistency / 100.0
+cons_bulk = a                                   # missed surplus days just slow gain
+cons_cut  = max(0.1, 1.6 * a - 0.6)             # off-days on a cut erase deficit harder
+calib_bulk = calib["bulk_mult"] if apply_calibration else 1.0
+calib_cut  = calib["cut_mult"]  if apply_calibration else 1.0
+mods = {"bulk_mult": cons_bulk * calib_bulk, "cut_mult": cons_cut * calib_cut}
+mods_tuple = (round(mods["bulk_mult"], 4), round(mods["cut_mult"], 4))
 
 auto_phases = cached_schedule(
     start_weight, start_bf, goal_weight, goal_bf, bf_ceiling, bf_floor,
-    (frame["height_in"], frame["ceiling_lean"], frame["baseline_lean"], frame["ffmi_ceiling"]),
-    (bulk_rate_override, cut_rate_override, bulk_muscle_override, cut_muscle_override),
-    max_weeks, max_phase_weeks,
-)
+    frame_tuple, ov_tuple, max_weeks, max_phase_weeks, mods_tuple, prior_peak)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODE UI
@@ -547,7 +804,8 @@ else:
 # ══════════════════════════════════════════════════════════════════════════════
 # SIMULATION + SUMMARY
 # ══════════════════════════════════════════════════════════════════════════════
-data = simulate_dynamic(start_weight, start_bf, active_phases, frame, start_date, overrides)
+data = simulate_dynamic(start_weight, start_bf, active_phases, frame, start_date,
+                        overrides, mods=mods, prior_peak=prior_peak)
 
 final = data[-1]
 start = data[0]
@@ -577,6 +835,52 @@ with c5:
     st.metric("Total Weeks", f"{total_weeks} wks")
     st.caption(f"≈ {round(total_weeks/4.33, 1)} months")
 
+# ── Timeline confidence band ───────────────────────────────────────────────────
+band = cached_band(start_weight, start_bf, goal_weight, goal_bf, bf_ceiling,
+                   bf_floor, frame_tuple, ov_tuple, max_weeks, max_phase_weeks,
+                   mods_tuple, prior_peak)
+band_weeks = [b["weeks"] for b in band]
+band_lo, band_hi = min(band_weeks), max(band_weeks)
+all_reached = all(b["reached"] for b in band)
+if band_lo == band_hi:
+    st.info(f"⏱️ **Timeline confidence band:** ~{band_lo} weeks even at ±2% start-BF "
+            f"measurement error. (Bands widen near your genetic ceiling, where "
+            f"slower rates amplify input error.)")
+else:
+    st.info(f"⏱️ **Timeline confidence band: {band_lo}–{band_hi} weeks** "
+            f"(plan re-run at start BF ±2%, the typical DEXA/scale measurement "
+            f"error). BF error mostly cancels for the goal itself but drives the "
+            f"rates — so treat the headline week count as the middle of this "
+            f"range, not a promise."
+            + ("" if all_reached else " ⚠️ At one band edge the plan doesn't fully "
+               "reach goal within max weeks — extend max weeks for a cleaner range."))
+
+# ── Personal calibration status ────────────────────────────────────────────────
+if actuals:
+    st.subheader("📉 Personal Calibration")
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Logged weigh-ins", f"{len(actuals)}")
+    bulk_ready = calib["bulk_n"] >= CALIB_MIN_SAMPLES
+    cut_ready  = calib["cut_n"]  >= CALIB_MIN_SAMPLES
+    k2.metric("Your bulk rate vs model",
+              f"×{calib['bulk_mult']:.2f}" if bulk_ready else "—",
+              f"{calib['bulk_n']}/{CALIB_MIN_SAMPLES} samples" if not bulk_ready
+              else f"{calib['bulk_n']} samples")
+    k3.metric("Your cut rate vs model",
+              f"×{calib['cut_mult']:.2f}" if cut_ready else "—",
+              f"{calib['cut_n']}/{CALIB_MIN_SAMPLES} samples" if not cut_ready
+              else f"{calib['cut_n']} samples")
+    if apply_calibration and (bulk_ready or cut_ready):
+        st.success("✅ Personal calibration is APPLIED to the plan above. "
+                   "Multipliers are measured against the raw (uncalibrated) model, "
+                   "so they stay stable instead of chasing their own output.")
+    elif apply_calibration:
+        st.warning(f"Calibration is on but needs ≥{CALIB_MIN_SAMPLES} matched weekly "
+                   f"deltas per phase type before it changes anything. Keep logging.")
+    else:
+        st.caption("Calibration computed but not applied — tick 'Apply personal "
+                   "calibration' in the sidebar to fit the plan to your data.")
+
 gw_gap = round(final["weight"] - goal_weight, 1)
 gbf_gap = round(final["bf"] - goal_bf, 1)
 if on_track:
@@ -602,12 +906,19 @@ fig = make_subplots(rows=2, cols=1,
     subplot_titles=("Scale Weight & Lean Mass (lbs)", "Body Fat %"),
     vertical_spacing=0.12, row_heights=[0.6, 0.4])
 
-fig.add_trace(go.Scatter(x=dates, y=weights, mode="lines+markers", name="Scale Weight",
+fig.add_trace(go.Scatter(x=dates, y=weights, mode="lines+markers", name="Projected Weight",
     line=dict(color="#10b981", width=2.5), marker=dict(size=3),
     hovertemplate="<b>%{text}</b><br>Weight: %{y} lbs<extra></extra>", text=plist), row=1, col=1)
 fig.add_trace(go.Scatter(x=dates, y=leans, mode="lines", name="Lean Mass",
     line=dict(color="#6366f1", width=1.8, dash="dot"),
     hovertemplate="<b>%{text}</b><br>Lean: %{y} lbs<extra></extra>", text=plist), row=1, col=1)
+if actuals:
+    fig.add_trace(go.Scatter(
+        x=[d for d, _ in actuals], y=[w for _, w in actuals],
+        mode="markers", name="Actual Weigh-ins",
+        marker=dict(symbol="diamond", size=7, color="#f8fafc",
+                    line=dict(color="#0ea5e9", width=1.5)),
+        hovertemplate="Actual: %{y} lbs<br>%{x}<extra></extra>"), row=1, col=1)
 fig.add_hline(y=goal_weight, line_dash="dash", line_color="rgba(255,255,255,0.27)",
     annotation_text=f"Goal: {goal_weight} lbs", row=1, col=1)
 fig.add_trace(go.Scatter(x=dates, y=bfs, mode="lines+markers", name="Body Fat %",
