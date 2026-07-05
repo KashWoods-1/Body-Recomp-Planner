@@ -793,7 +793,7 @@ with st.sidebar:
              "number. Rough guide for men: 10–12% = visible abs, 13–15% = "
              "lean and athletic, 16–19% = fit but softer, 20%+ = little "
              "muscle definition. For women, add roughly 8–10 points to each "
-             "of those. A simple starting point: aim 1–2 points below where "
+             "of those. A simple starting point: aim 2–3 points below where "
              "you are now, see how you look and feel, then adjust. You can "
              "change this anytime.")
     bf_ceiling  = st.number_input("Max BF% (ceiling)", 8.0, 35.0, 17.0, 0.5)
