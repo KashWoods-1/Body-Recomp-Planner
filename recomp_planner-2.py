@@ -813,7 +813,7 @@ with st.sidebar:
                    "times with realistic variation in two things nobody knows "
                    "exactly: your true starting body fat, and how fast your body "
                    "responds compared to average.")
-        bf_sd_ui   = st.slider("Body-fat reading accuracy (±%)", 0.5, 4, 1.0, 0.25,
+        bf_sd_ui   = st.slider("Body-fat reading accuracy (±%)", 0.5, 2.5, 1.0, 0.25,
                                help="How trustworthy your starting body-fat number "
                                     "is. 1.0 if it came from a DEXA scan; 2.0+ if "
                                     "it's a smart-scale reading or an eyeball "
