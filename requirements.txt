@@ -1,4 +1,5 @@
 streamlit
 plotly
-python-dateutil
 pandas
+sqlalchemy
+psycopg2-binary
