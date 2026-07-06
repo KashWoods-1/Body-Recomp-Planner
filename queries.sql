@@ -27,6 +27,27 @@ SELECT
 FROM weigh_ins
 ORDER BY date;
 
+-- ─────────────────────────────────────────────────────────────────────────
+-- SAME QUERY, POSTGRES DIALECT (for Neon's browser SQL editor). Postgres can
+-- RANGE over dates directly with an INTERVAL — no julianday() workaround.
+-- Dialect differences like this are everyday analyst life; noticing them is
+-- part of the skill.
+--
+-- SELECT
+--     date,
+--     weight_lbs,
+--     ROUND(AVG(weight_lbs) OVER (
+--             ORDER BY date
+--             RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW
+--           )::numeric, 2)                     AS rolling_7d_avg,
+--     COUNT(*) OVER (
+--             ORDER BY date
+--             RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW
+--           )                                  AS days_in_window
+-- FROM weigh_ins
+-- ORDER BY date;
+-- ─────────────────────────────────────────────────────────────────────────
+
 -- Your turn next (Phase 2 ladder, in order):
 --   2. Weekly rate of change per phase        (LAG, GROUP BY, date math)
 --   3. Logging streaks & gaps                 (gaps-and-islands)
