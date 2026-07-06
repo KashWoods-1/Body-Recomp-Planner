@@ -7,11 +7,17 @@ Usage:
 Deliberately tiny: the point of Phase 2 is writing SQL in .sql files, not
 building tooling. Resist the urge to grow this script.
 """
+import os
 import sys
 from pathlib import Path
 import recomp_db
 
-DB = Path(__file__).parent / "recomp_data.db"
+# Default: the local SQLite file. To run queries against your cloud (Neon)
+# database instead, set DATABASE_URL first — or just use Neon's SQL editor
+# in the browser, which is the friendlier option anyway.
+DB_URL = os.environ.get(
+    "DATABASE_URL",
+    f"sqlite:///{Path(__file__).parent / 'recomp_data.db'}")
 
 def main():
     sql_file = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("queries.sql")
@@ -20,7 +26,7 @@ def main():
     stmts = [q.strip() for q in sql.split(";") if q.strip()
              and not all(ln.strip().startswith("--") for ln in q.strip().splitlines())]
     for i, stmt in enumerate(stmts, 1):
-        cols, rows = recomp_db.run_query(DB, stmt)
+        cols, rows = recomp_db.run_query(recomp_db.get_engine(DB_URL), stmt)
         print(f"\n── statement {i} ── ({len(rows)} rows)")
         if cols:
             widths = [max(len(str(c)), *(len(str(r[j])) for r in rows)) if rows
