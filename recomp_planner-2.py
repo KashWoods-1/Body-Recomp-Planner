@@ -9,7 +9,25 @@ import io
 from pathlib import Path
 
 import recomp_db
-DB_PATH = Path(__file__).parent / "recomp_data.db"
+
+# ── Storage backend ────────────────────────────────────────────────────────────
+# If a DATABASE_URL secret is configured (Streamlit Cloud -> app Settings ->
+# Secrets), we use that hosted Postgres database and data survives redeploys.
+# Otherwise we fall back to a local SQLite file next to this script — durable
+# when running on your own machine, EPHEMERAL on Streamlit Cloud.
+_SQLITE_PATH = Path(__file__).parent / "recomp_data.db"
+
+@st.cache_resource
+def _db_engine():
+    url = None
+    try:
+        url = st.secrets.get("DATABASE_URL", None)
+    except Exception:
+        url = None   # no secrets file at all (typical local run)
+    return recomp_db.get_engine(url or f"sqlite:///{_SQLITE_PATH}")
+
+ENGINE = _db_engine()
+DB_IS_CLOUD = recomp_db.backend_name(ENGINE) == "postgresql"
 
 st.set_page_config(page_title="Recomp Planner", page_icon="💪", layout="wide")
 st.title("💪 Body Recomposition Planner")
@@ -901,9 +919,16 @@ with st.sidebar:
 
     # ── actuals log (feeds personal calibration + chart overlay) ───────────────
     with st.expander("📉 Log your weigh-ins", expanded=False):
-        st.caption("Log real weigh-ins (or import a CSV with `date,weight` columns "
-                   "— MacroFactor exports work). Data lives in this browser "
-                   "session only; use Download to keep it between sessions.")
+        if DB_IS_CLOUD:
+            st.caption("🟢 **Saving to your cloud database** — data persists "
+                       "across redeploys and devices.")
+        else:
+            st.caption("🟡 **Saving to a local file** — permanent on your own "
+                       "computer, but wiped on redeploy if this is the hosted "
+                       "app. To make the hosted app persistent, add a "
+                       "DATABASE_URL secret (free Neon database).")
+        st.caption("Log real weigh-ins here, or import a CSV with `date,weight` "
+                   "columns — MacroFactor exports work.")
         up = st.file_uploader("Import CSV", type="csv", key="actuals_csv")
         if up is not None and st.session_state.get("actuals_csv_name") != up.name:
             try:
@@ -922,7 +947,7 @@ with st.sidebar:
                 st.error(f"Couldn't parse CSV: {e}")
 
         if "actuals_df" not in st.session_state:
-            saved = recomp_db.load_weigh_ins(DB_PATH)
+            saved = recomp_db.load_weigh_ins(ENGINE)
             if saved:
                 st.session_state.actuals_df = pd.DataFrame(
                     {"date": pd.to_datetime([d for d, _ in saved]),
@@ -946,7 +971,7 @@ with st.sidebar:
         actuals = _parse_actuals_df(edited_actuals)
         if actuals:
             if st.button("💾 Save weigh-ins"):
-                n = recomp_db.save_weigh_ins(DB_PATH, actuals)
+                n = recomp_db.save_weigh_ins(ENGINE, actuals)
                 st.success(f"Saved {n} weigh-ins — they'll be here next time "
                            f"you open the app.")
             csv_buf = io.StringIO()
@@ -1271,11 +1296,11 @@ with snap_col:
             "headline_weeks": total_weeks,
         }
         pid = recomp_db.save_plan_snapshot(
-            DB_PATH, plan_inputs, active_phases, data,
+            ENGINE, plan_inputs, active_phases, data,
             calib if actuals else None)
         st.success(f"Saved as plan #{pid}")
 with snap_info:
-    n_saved = recomp_db.count_plans(DB_PATH)
+    n_saved = recomp_db.count_plans(ENGINE)
     st.caption(f"{n_saved} plan{'s' if n_saved != 1 else ''} saved so far. "
                "Save whenever you meaningfully change the plan — each snapshot "
                "is a prediction you can later check against reality.")
