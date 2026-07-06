@@ -966,6 +966,15 @@ with st.sidebar:
                                                         min_value=50.0, max_value=500.0,
                                                         step=0.1, format="%.1f"),
             })
+        # Coerce dtypes EVERY run. Adding a blank row makes pandas flip a
+        # column to 'object' dtype; feeding that back into data_editor on the
+        # next rerun fails Streamlit's type check (StreamlitAPIException in
+        # _check_type_compatibilities). Normalizing here keeps the frame
+        # permanently compatible with the column config above.
+        edited_actuals = pd.DataFrame({
+            "date": pd.to_datetime(edited_actuals.get("date"), errors="coerce"),
+            "weight": pd.to_numeric(edited_actuals.get("weight"), errors="coerce"),
+        })
         st.session_state.actuals_df = edited_actuals
 
         actuals = _parse_actuals_df(edited_actuals)
