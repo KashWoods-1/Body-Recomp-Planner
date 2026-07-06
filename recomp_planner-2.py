@@ -6,6 +6,10 @@ import pandas as pd
 import math
 import uuid
 import io
+from pathlib import Path
+
+import recomp_db
+DB_PATH = Path(__file__).parent / "recomp_data.db"
 
 st.set_page_config(page_title="Recomp Planner", page_icon="💪", layout="wide")
 st.title("💪 Body Recomposition Planner")
@@ -793,7 +797,7 @@ with st.sidebar:
              "number. Rough guide for men: 10–12% = visible abs, 13–15% = "
              "lean and athletic, 16–19% = fit but softer, 20%+ = little "
              "muscle definition. For women, add roughly 8–10 points to each "
-             "of those. A simple starting point: aim 2–3 points below where "
+             "of those. A simple starting point: aim 1–2 points below where "
              "you are now, see how you look and feel, then adjust. You can "
              "change this anytime.")
     bf_ceiling  = st.number_input("Max BF% (ceiling)", 8.0, 35.0, 17.0, 0.5)
@@ -918,9 +922,15 @@ with st.sidebar:
                 st.error(f"Couldn't parse CSV: {e}")
 
         if "actuals_df" not in st.session_state:
-            st.session_state.actuals_df = pd.DataFrame(
-                {"date": pd.Series(dtype="datetime64[ns]"),
-                 "weight": pd.Series(dtype="float")})
+            saved = recomp_db.load_weigh_ins(DB_PATH)
+            if saved:
+                st.session_state.actuals_df = pd.DataFrame(
+                    {"date": pd.to_datetime([d for d, _ in saved]),
+                     "weight": [w for _, w in saved]})
+            else:
+                st.session_state.actuals_df = pd.DataFrame(
+                    {"date": pd.Series(dtype="datetime64[ns]"),
+                     "weight": pd.Series(dtype="float")})
 
         edited_actuals = st.data_editor(
             st.session_state.actuals_df,
@@ -935,6 +945,10 @@ with st.sidebar:
 
         actuals = _parse_actuals_df(edited_actuals)
         if actuals:
+            if st.button("💾 Save weigh-ins"):
+                n = recomp_db.save_weigh_ins(DB_PATH, actuals)
+                st.success(f"Saved {n} weigh-ins — they'll be here next time "
+                           f"you open the app.")
             csv_buf = io.StringIO()
             pd.DataFrame(actuals, columns=["date", "weight"]).to_csv(csv_buf, index=False)
             st.download_button("⬇️ Download actuals CSV", csv_buf.getvalue(),
@@ -1240,6 +1254,31 @@ else:
     st.warning(f"⚠️ Closest the model reaches: {final['weight']} lbs @ {final['bf']}% BF "
                f"(off by {gw_gap:+.1f} lbs, {gbf_gap:+.1f}% BF). "
                f"This is the honest limit given your rates — extend max weeks or adjust goal.")
+
+# ── Plan snapshot: a deliberate save, not automatic (Streamlit reruns on every
+# widget touch — auto-saving would spam junk plans). One click stores the plan
+# inputs, its full weekly projection, and the calibration state at this moment,
+# so later you can compare what the model PREDICTED against what actually
+# happened (the predictions-vs-weigh_ins join).
+snap_col, snap_info = st.columns([1, 3])
+with snap_col:
+    if st.button("💾 Save this plan"):
+        plan_inputs = {
+            "start_weight": start_weight, "start_bf": start_bf,
+            "goal_weight": goal_weight, "goal_bf": goal_bf,
+            "bf_ceiling": bf_ceiling, "bf_floor": bf_floor,
+            "consistency": consistency, "recomp_allowed": allow_recomp,
+            "headline_weeks": total_weeks,
+        }
+        pid = recomp_db.save_plan_snapshot(
+            DB_PATH, plan_inputs, active_phases, data,
+            calib if actuals else None)
+        st.success(f"Saved as plan #{pid}")
+with snap_info:
+    n_saved = recomp_db.count_plans(DB_PATH)
+    st.caption(f"{n_saved} plan{'s' if n_saved != 1 else ''} saved so far. "
+               "Save whenever you meaningfully change the plan — each snapshot "
+               "is a prediction you can later check against reality.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CHARTS
