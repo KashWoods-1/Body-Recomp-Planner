@@ -1,179 +1,190 @@
-"""SQLite persistence for the recomp planner.
+"""Database layer for the recomp planner — works against BOTH:
 
-Design notes (the WHY, since this doubles as a learning artifact):
+  - SQLite (a local file, zero setup) when no DATABASE_URL is configured
+  - Postgres (e.g. a free Neon database) when DATABASE_URL is set in
+    Streamlit Cloud secrets — this is what makes the deployed app's data
+    survive redeploys.
 
-- Five tables. `weigh_ins` is ground truth. `plans` snapshots the INPUTS of a
-  generated plan; `plan_phases` and `predictions` are its children (what the
-  model said would happen, week by week). `calibration_events` records each
-  fit of your personal multipliers. Predicted-vs-actual analysis is then a
-  JOIN between `predictions` and `weigh_ins` — the whole point of the schema.
+Built on SQLAlchemy Core so the same table definitions and functions run on
+both engines. Schema design notes:
 
-- `weigh_ins.date` has a UNIQUE constraint: one weigh-in per day. Re-saving
-  replaces the table contents inside a transaction (the app's editor is the
-  source of truth, so deletions propagate).
-
-- `predictions` uses a composite primary key (plan_id, week_num): a week of a
-  plan is identified by which plan it belongs to plus its position. No
-  surrogate id needed — the natural key IS the identity.
-
-- Dates are stored as ISO-8601 TEXT ('2026-07-05'). SQLite has no DATE type;
-  ISO strings sort correctly and julianday()/date() functions parse them.
-
-- Foreign keys are ON per-connection (SQLite default is OFF, a classic trap).
+  - `weigh_ins.date` UNIQUE: one weigh-in per day; re-saving full-syncs the
+    table (the app editor is the source of truth, deletions propagate).
+  - `predictions` composite primary key (plan_id, week_num): a week of a plan
+    is identified by which plan it belongs to plus its position.
+  - Foreign keys cascade: deleting a plan removes its phases/predictions.
+    (SQLite ships with FK enforcement OFF; the connect hook below turns it on.)
 """
 
-import sqlite3
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, date as date_type
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS weigh_ins (
-    id          INTEGER PRIMARY KEY,
-    date        TEXT NOT NULL UNIQUE,          -- ISO 'YYYY-MM-DD'
-    weight_lbs  REAL NOT NULL CHECK (weight_lbs BETWEEN 50 AND 500),
-    source      TEXT NOT NULL DEFAULT 'app'    -- 'app' | 'csv_import' | ...
-);
+from sqlalchemy import (create_engine, event, text, MetaData, Table, Column,
+                        Integer, Float, Text, Date, DateTime, ForeignKey)
 
-CREATE TABLE IF NOT EXISTS plans (
-    id              INTEGER PRIMARY KEY,
-    created_at      TEXT NOT NULL,             -- ISO timestamp
-    start_weight    REAL NOT NULL,
-    start_bf        REAL NOT NULL,
-    goal_weight     REAL NOT NULL,
-    goal_bf         REAL NOT NULL,
-    bf_ceiling      REAL NOT NULL,
-    bf_floor        REAL NOT NULL,
-    consistency     INTEGER NOT NULL,
-    recomp_allowed  INTEGER NOT NULL,          -- 0/1 (SQLite has no BOOLEAN)
-    headline_weeks  INTEGER NOT NULL
-);
+metadata = MetaData()
 
-CREATE TABLE IF NOT EXISTS plan_phases (
-    plan_id     INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
-    seq         INTEGER NOT NULL,              -- 0-based position in the plan
-    phase_type  TEXT NOT NULL CHECK (phase_type IN ('bulk','cut','maintain')),
-    weeks       INTEGER NOT NULL,
-    PRIMARY KEY (plan_id, seq)
-);
+weigh_ins = Table(
+    "weigh_ins", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("date", Date, nullable=False, unique=True),
+    Column("weight_lbs", Float, nullable=False),
+    Column("source", Text, nullable=False, server_default="app"),
+)
 
-CREATE TABLE IF NOT EXISTS predictions (
-    plan_id     INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
-    week_num    INTEGER NOT NULL,
-    pred_date   TEXT NOT NULL,
-    phase_type  TEXT NOT NULL,
-    weight      REAL NOT NULL,
-    lean        REAL NOT NULL,
-    fat         REAL NOT NULL,
-    bf          REAL NOT NULL,
-    PRIMARY KEY (plan_id, week_num)
-);
+plans = Table(
+    "plans", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("created_at", DateTime, nullable=False),
+    Column("start_weight", Float, nullable=False),
+    Column("start_bf", Float, nullable=False),
+    Column("goal_weight", Float, nullable=False),
+    Column("goal_bf", Float, nullable=False),
+    Column("bf_ceiling", Float, nullable=False),
+    Column("bf_floor", Float, nullable=False),
+    Column("consistency", Integer, nullable=False),
+    Column("recomp_allowed", Integer, nullable=False),
+    Column("headline_weeks", Integer, nullable=False),
+)
 
-CREATE TABLE IF NOT EXISTS calibration_events (
-    id              INTEGER PRIMARY KEY,
-    run_at          TEXT NOT NULL,
-    plan_id         INTEGER REFERENCES plans(id) ON DELETE SET NULL,
-    phase_type      TEXT NOT NULL CHECK (phase_type IN ('bulk','cut')),
-    multiplier      REAL NOT NULL,
-    standard_error  REAL,
-    n_points        INTEGER NOT NULL
-);
+plan_phases = Table(
+    "plan_phases", metadata,
+    Column("plan_id", Integer,
+           ForeignKey("plans.id", ondelete="CASCADE"), primary_key=True),
+    Column("seq", Integer, primary_key=True),
+    Column("phase_type", Text, nullable=False),
+    Column("weeks", Integer, nullable=False),
+)
 
-CREATE INDEX IF NOT EXISTS idx_predictions_date ON predictions(pred_date);
-"""
+predictions = Table(
+    "predictions", metadata,
+    Column("plan_id", Integer,
+           ForeignKey("plans.id", ondelete="CASCADE"), primary_key=True),
+    Column("week_num", Integer, primary_key=True),
+    Column("pred_date", Date, nullable=False),
+    Column("phase_type", Text, nullable=False),
+    Column("weight", Float, nullable=False),
+    Column("lean", Float, nullable=False),
+    Column("fat", Float, nullable=False),
+    Column("bf", Float, nullable=False),
+)
 
-
-def _connect(db_path):
-    con = sqlite3.connect(str(db_path))
-    con.execute("PRAGMA foreign_keys = ON")
-    return con
-
-
-def init_db(db_path):
-    """Create tables if absent. Safe to call every app start."""
-    with _connect(db_path) as con:
-        con.executescript(SCHEMA)
+calibration_events = Table(
+    "calibration_events", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("run_at", DateTime, nullable=False),
+    Column("plan_id", Integer,
+           ForeignKey("plans.id", ondelete="SET NULL"), nullable=True),
+    Column("phase_type", Text, nullable=False),
+    Column("multiplier", Float, nullable=False),
+    Column("standard_error", Float, nullable=True),
+    Column("n_points", Integer, nullable=False),
+)
 
 
-def load_weigh_ins(db_path):
-    """Return list of (iso_date_str, weight) sorted by date. [] if none/no db."""
-    if not Path(db_path).exists():
-        return []
-    with _connect(db_path) as con:
+def get_engine(url):
+    """url: 'sqlite:///path/to/file.db' or a Postgres URL.
+    Neon hands out 'postgres://' or 'postgresql://' strings; SQLAlchemy 2.x
+    needs the explicit driver, so we normalize. pool_pre_ping revives
+    connections that Neon's autosuspend has quietly closed."""
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    eng = create_engine(url, pool_pre_ping=True)
+    if eng.dialect.name == "sqlite":
+        @event.listens_for(eng, "connect")
+        def _enable_fk(dbapi_con, _):
+            dbapi_con.execute("PRAGMA foreign_keys=ON")
+    return eng
+
+
+def init_db(engine):
+    """Create any missing tables. Safe to call on every app start."""
+    metadata.create_all(engine)
+
+
+def backend_name(engine):
+    """'sqlite' or 'postgresql' — the app shows this so the user always knows
+    whether saves are going somewhere durable."""
+    return engine.dialect.name
+
+
+def load_weigh_ins(engine):
+    """Return list of (date, weight) sorted by date."""
+    init_db(engine)
+    with engine.connect() as con:
         rows = con.execute(
-            "SELECT date, weight_lbs FROM weigh_ins ORDER BY date").fetchall()
-    return rows
+            weigh_ins.select().order_by(weigh_ins.c.date)).fetchall()
+    return [(r.date, r.weight_lbs) for r in rows]
 
 
-def save_weigh_ins(db_path, entries, source="app"):
-    """Full-sync the weigh_ins table to `entries` (list of (date, weight)).
-    The app's editor is the source of truth: rows deleted there disappear
-    here too. One transaction, so a crash can't leave a half-synced table."""
-    init_db(db_path)
-    with _connect(db_path) as con:
-        con.execute("DELETE FROM weigh_ins")
-        con.executemany(
-            "INSERT INTO weigh_ins (date, weight_lbs, source) VALUES (?, ?, ?)",
-            [(d.isoformat() if hasattr(d, "isoformat") else str(d),
-              float(w), source) for d, w in entries])
-    return len(entries)
+def save_weigh_ins(engine, entries, source="app"):
+    """Full-sync weigh_ins to `entries` (list of (date, weight)) in one
+    transaction — deletions in the app editor propagate here."""
+    init_db(engine)
+    payload = []
+    for d, w in entries:
+        if isinstance(d, str):
+            d = date_type.fromisoformat(d[:10])
+        elif hasattr(d, "date") and not isinstance(d, date_type):
+            d = d.date()   # pandas Timestamp / datetime -> date
+        payload.append({"date": d, "weight_lbs": float(w), "source": source})
+    with engine.begin() as con:
+        con.execute(weigh_ins.delete())
+        if payload:
+            con.execute(weigh_ins.insert(), payload)
+    return len(payload)
 
 
-def save_plan_snapshot(db_path, inputs, phases, prediction_rows, calib=None):
-    """Persist one generated plan: inputs, phase list, full weekly projection,
-    and (optionally) the calibration state at the moment of saving.
-    Returns the new plan id."""
-    init_db(db_path)
-    with _connect(db_path) as con:
-        cur = con.execute(
-            """INSERT INTO plans (created_at, start_weight, start_bf,
-                 goal_weight, goal_bf, bf_ceiling, bf_floor, consistency,
-                 recomp_allowed, headline_weeks)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (datetime.now().isoformat(timespec="seconds"),
-             inputs["start_weight"], inputs["start_bf"],
-             inputs["goal_weight"], inputs["goal_bf"],
-             inputs["bf_ceiling"], inputs["bf_floor"],
-             inputs["consistency"], int(inputs["recomp_allowed"]),
-             inputs["headline_weeks"]))
-        plan_id = cur.lastrowid
+def save_plan_snapshot(engine, inputs, phases, prediction_rows, calib=None):
+    """Persist one generated plan: inputs, phases, full weekly projection, and
+    (optionally) the calibration state at save time. Returns the plan id."""
+    init_db(engine)
+    now = datetime.now().replace(microsecond=0)
+    with engine.begin() as con:
+        res = con.execute(plans.insert().values(
+            created_at=now,
+            start_weight=inputs["start_weight"], start_bf=inputs["start_bf"],
+            goal_weight=inputs["goal_weight"], goal_bf=inputs["goal_bf"],
+            bf_ceiling=inputs["bf_ceiling"], bf_floor=inputs["bf_floor"],
+            consistency=inputs["consistency"],
+            recomp_allowed=int(inputs["recomp_allowed"]),
+            headline_weeks=inputs["headline_weeks"]))
+        plan_id = res.inserted_primary_key[0]
 
-        con.executemany(
-            "INSERT INTO plan_phases (plan_id, seq, phase_type, weeks) VALUES (?,?,?,?)",
-            [(plan_id, i, p["type"], p.get("weeks", 4))
-             for i, p in enumerate(phases)])
+        con.execute(plan_phases.insert(), [
+            {"plan_id": plan_id, "seq": i,
+             "phase_type": p["type"], "weeks": p.get("weeks", 4)}
+            for i, p in enumerate(phases)])
 
-        con.executemany(
-            """INSERT INTO predictions
-                 (plan_id, week_num, pred_date, phase_type, weight, lean, fat, bf)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            [(plan_id, r["week"], r["date"].isoformat(), r["phase_type"],
-              r["weight"], r["lean"], r["fat"], r["bf"])
-             for r in prediction_rows])
+        con.execute(predictions.insert(), [
+            {"plan_id": plan_id, "week_num": r["week"], "pred_date": r["date"],
+             "phase_type": r["phase_type"], "weight": r["weight"],
+             "lean": r["lean"], "fat": r["fat"], "bf": r["bf"]}
+            for r in prediction_rows])
 
         if calib is not None:
-            now = datetime.now().isoformat(timespec="seconds")
             for pt in ("bulk", "cut"):
                 if calib.get(f"{pt}_n", 0) > 0:
-                    con.execute(
-                        """INSERT INTO calibration_events
-                             (run_at, plan_id, phase_type, multiplier,
-                              standard_error, n_points)
-                           VALUES (?,?,?,?,?,?)""",
-                        (now, plan_id, pt, calib[f"{pt}_mult"],
-                         calib.get(f"{pt}_se"), calib[f"{pt}_n"]))
+                    con.execute(calibration_events.insert().values(
+                        run_at=now, plan_id=plan_id, phase_type=pt,
+                        multiplier=calib[f"{pt}_mult"],
+                        standard_error=calib.get(f"{pt}_se"),
+                        n_points=calib[f"{pt}_n"]))
     return plan_id
 
 
-def count_plans(db_path):
-    if not Path(db_path).exists():
-        return 0
-    with _connect(db_path) as con:
-        return con.execute("SELECT COUNT(*) FROM plans").fetchone()[0]
+def count_plans(engine):
+    init_db(engine)
+    with engine.connect() as con:
+        return con.execute(text("SELECT COUNT(*) FROM plans")).scalar()
 
 
-def run_query(db_path, sql, params=()):
-    """Convenience for analysis scripts: returns (column_names, rows)."""
-    with _connect(db_path) as con:
-        cur = con.execute(sql, params)
-        cols = [c[0] for c in cur.description] if cur.description else []
-        return cols, cur.fetchall()
+def run_query(engine, sql, params=None):
+    """For analysis scripts: returns (column_names, rows)."""
+    with engine.connect() as con:
+        cur = con.execute(text(sql), params or {})
+        cols = list(cur.keys()) if cur.returns_rows else []
+        rows = cur.fetchall() if cur.returns_rows else []
+        con.commit()
+    return cols, rows
