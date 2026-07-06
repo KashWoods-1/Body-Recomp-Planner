@@ -927,25 +927,8 @@ with st.sidebar:
                        "computer, but wiped on redeploy if this is the hosted "
                        "app. To make the hosted app persistent, add a "
                        "DATABASE_URL secret (free Neon database).")
-        st.caption("Log real weigh-ins here, or import a CSV with `date,weight` "
-                   "columns — MacroFactor exports work.")
-        up = st.file_uploader("Import CSV", type="csv", key="actuals_csv")
-        if up is not None and st.session_state.get("actuals_csv_name") != up.name:
-            try:
-                raw = pd.read_csv(up)
-                raw.columns = [c.strip().lower() for c in raw.columns]
-                if "date" in raw.columns and "weight" in raw.columns:
-                    imp = raw[["date", "weight"]].copy()
-                    imp["date"] = pd.to_datetime(imp["date"], errors="coerce")
-                    imp["weight"] = pd.to_numeric(imp["weight"], errors="coerce")
-                    imp = imp.dropna()
-                    st.session_state.actuals_df = imp
-                    st.session_state.actuals_csv_name = up.name
-                else:
-                    st.error("CSV needs `date` and `weight` columns.")
-            except Exception as e:
-                st.error(f"Couldn't parse CSV: {e}")
 
+        # ── load history from the database once per session ────────────────
         if "actuals_df" not in st.session_state:
             saved = recomp_db.load_weigh_ins(ENGINE)
             if saved:
@@ -957,36 +940,96 @@ with st.sidebar:
                     {"date": pd.Series(dtype="datetime64[ns]"),
                      "weight": pd.Series(dtype="float")})
 
-        edited_actuals = st.data_editor(
-            st.session_state.actuals_df,
-            num_rows="dynamic", hide_index=True, key="actuals_editor",
-            column_config={
-                "date": st.column_config.DateColumn("Date"),
-                "weight": st.column_config.NumberColumn("Weight (lbs)",
-                                                        min_value=50.0, max_value=500.0,
-                                                        step=0.1, format="%.1f"),
-            })
-        # Coerce dtypes EVERY run. Adding a blank row makes pandas flip a
-        # column to 'object' dtype; feeding that back into data_editor on the
-        # next rerun fails Streamlit's type check (StreamlitAPIException in
-        # _check_type_compatibilities). Normalizing here keeps the frame
-        # permanently compatible with the column config above.
-        edited_actuals = pd.DataFrame({
-            "date": pd.to_datetime(edited_actuals.get("date"), errors="coerce"),
-            "weight": pd.to_numeric(edited_actuals.get("weight"), errors="coerce"),
-        })
-        st.session_state.actuals_df = edited_actuals
+        # ── quick add: the daily path. st.form batches inputs so nothing
+        # reruns until submit — no lag, no half-entered rows getting eaten.
+        # One click adds the row AND saves to the database.
+        # NOTE: widgets use explicit keys with defaults seeded ONCE per
+        # session. Passing a computed `value=` param instead would change the
+        # widget's identity whenever the data changes, silently dropping
+        # whatever the user typed (the "had to enter it twice" bug). ────────
+        _hist = st.session_state.actuals_df
+        if "wi_weight" not in st.session_state:
+            st.session_state.wi_weight = (
+                round(float(_hist["weight"].dropna().iloc[-1]), 1)
+                if not _hist.empty and _hist["weight"].notna().any() else 150.0)
+        if "wi_date" not in st.session_state:
+            st.session_state.wi_date = date.today()
+        with st.form("add_weighin", clear_on_submit=False, border=False):
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                wi_date = st.date_input("Date", key="wi_date")
+            with fc2:
+                wi_wt = st.number_input("Weight (lbs)", 50.0, 500.0,
+                                        step=0.1, format="%.1f",
+                                        key="wi_weight")
+            wi_submit = st.form_submit_button("➕ Add & save", type="primary")
+        if wi_submit:
+            df = st.session_state.actuals_df.copy()
+            if not df.empty:
+                # same-date entry replaces (one weigh-in per day)
+                df = df[pd.to_datetime(df["date"], errors="coerce").dt.date != wi_date]
+            df = pd.concat([df, pd.DataFrame({"date": [pd.Timestamp(wi_date)],
+                                              "weight": [wi_wt]})],
+                           ignore_index=True).sort_values("date")
+            st.session_state.actuals_df = df
+            recomp_db.save_weigh_ins(ENGINE, _parse_actuals_df(df))
+            st.success(f"Saved: {wi_date} — {wi_wt:.1f} lbs")
 
-        actuals = _parse_actuals_df(edited_actuals)
-        if actuals:
-            if st.button("💾 Save weigh-ins"):
-                n = recomp_db.save_weigh_ins(ENGINE, actuals)
-                st.success(f"Saved {n} weigh-ins — they'll be here next time "
-                           f"you open the app.")
-            csv_buf = io.StringIO()
-            pd.DataFrame(actuals, columns=["date", "weight"]).to_csv(csv_buf, index=False)
-            st.download_button("⬇️ Download actuals CSV", csv_buf.getvalue(),
-                               "actuals.csv", "text/csv")
+        n_log = len(_parse_actuals_df(st.session_state.actuals_df))
+        st.caption(f"{n_log} weigh-in{'s' if n_log != 1 else ''} logged.")
+
+        # ── history editing & CSV import: tucked away — the table widget is
+        # clunky, so it's for occasional corrections, not daily entry ───────
+        if st.toggle("✏️ Edit history / import CSV"):
+            up = st.file_uploader("Import CSV (date,weight — MacroFactor "
+                                  "exports work)", type="csv", key="actuals_csv")
+            if up is not None and st.session_state.get("actuals_csv_name") != up.name:
+                try:
+                    raw = pd.read_csv(up)
+                    raw.columns = [c.strip().lower() for c in raw.columns]
+                    if "date" in raw.columns and "weight" in raw.columns:
+                        imp = raw[["date", "weight"]].copy()
+                        imp["date"] = pd.to_datetime(imp["date"], errors="coerce")
+                        imp["weight"] = pd.to_numeric(imp["weight"], errors="coerce")
+                        imp = imp.dropna().sort_values("date")
+                        st.session_state.actuals_df = imp
+                        st.session_state.actuals_csv_name = up.name
+                        recomp_db.save_weigh_ins(ENGINE, _parse_actuals_df(imp),
+                                                 source="csv_import")
+                        st.success(f"Imported and saved {len(imp)} weigh-ins.")
+                    else:
+                        st.error("CSV needs `date` and `weight` columns.")
+                except Exception as e:
+                    st.error(f"Couldn't parse CSV: {e}")
+
+            edited_actuals = st.data_editor(
+                st.session_state.actuals_df,
+                num_rows="dynamic", hide_index=True, key="actuals_editor",
+                column_config={
+                    "date": st.column_config.DateColumn("Date"),
+                    "weight": st.column_config.NumberColumn(
+                        "Weight (lbs)", min_value=50.0, max_value=500.0,
+                        step=0.1, format="%.1f"),
+                })
+            # Coerce dtypes EVERY run: a blank row flips columns to 'object',
+            # which crashes data_editor's type check on the next rerun.
+            edited_actuals = pd.DataFrame({
+                "date": pd.to_datetime(edited_actuals.get("date"), errors="coerce"),
+                "weight": pd.to_numeric(edited_actuals.get("weight"), errors="coerce"),
+            })
+            st.session_state.actuals_df = edited_actuals
+            if st.button("💾 Save edits"):
+                n = recomp_db.save_weigh_ins(
+                    ENGINE, _parse_actuals_df(edited_actuals))
+                st.success(f"Saved {n} weigh-ins.")
+            if n_log:
+                csv_buf = io.StringIO()
+                pd.DataFrame(_parse_actuals_df(st.session_state.actuals_df),
+                             columns=["date", "weight"]).to_csv(csv_buf, index=False)
+                st.download_button("⬇️ Download backup CSV", csv_buf.getvalue(),
+                                   "weigh_ins.csv", "text/csv")
+
+        actuals = _parse_actuals_df(st.session_state.actuals_df)
         apply_calibration = st.checkbox(
             "Apply personal calibration", value=False,
             help="Adjusts the plan to how YOUR body has actually been "
