@@ -668,6 +668,29 @@ def auto_schedule_dynamic(start_weight, start_bf, goal_weight, goal_bf,
 # ══════════════════════════════════════════════════════════════════════════════
 CALIB_MIN_SAMPLES = 4     # matched weekly deltas per phase type before we trust it
 CALIB_CLAMP = (0.4, 2.0)  # sanity bounds on the personal multiplier
+CALIB_SKIP_WEEKS = 3      # weeks ignored after the plan start and after every
+                          # phase transition. Starting a surplus or deficit
+                          # shifts pounds of water, glycogen, and gut content
+                          # in the first weeks — fitting a RATE on that
+                          # transient wildly overestimates it (the classic
+                          # "gained 4 lbs in 3 weeks of bulking" illusion).
+                          # Only steady-state weeks inform the multiplier.
+
+def _transient_weeks(baseline_rows):
+    """Weeks to exclude from ALL data-driven fitting: the plan start and every
+    phase transition kick off CALIB_SKIP_WEEKS of water/glycogen/gut-content
+    noise. Applies equally to scale weight and waist — the same transient
+    inflates both."""
+    transient = set()
+    prev_pt = None
+    for r in baseline_rows:
+        pt = r["phase_type"]
+        if pt in ("bulk", "cut") and pt != prev_pt:
+            for k in range(CALIB_SKIP_WEEKS):
+                transient.add(r["week"] + k)
+        prev_pt = pt
+    return transient
+
 
 def calibrate_from_actuals(actuals, baseline_rows):
     """Estimate personal rate multipliers AND their standard errors from logged
@@ -697,11 +720,17 @@ def calibrate_from_actuals(actuals, baseline_rows):
     if len(actuals) < 2 or not baseline_rows:
         return out
 
-    # 1. Match each weigh-in to its nearest projection row (within 10 days)
+    transient = _transient_weeks(baseline_rows)
+
+    # 1. Match each weigh-in to its nearest projection row (within 10 days),
+    # skipping transient weeks
     matched = []   # (date, obs_weight, phase_type, proj_weight)
-    for (d, w) in actuals:
+    for row in actuals:
+        d, w = row[0], row[1]
         nearest = min(baseline_rows, key=lambda r: abs((r["date"] - d).days))
         if abs((nearest["date"] - d).days) > 10:
+            continue
+        if nearest["week"] in transient:
             continue
         if nearest["phase_type"] in ("bulk", "cut"):
             matched.append((d, w, nearest["phase_type"], nearest["weight"]))
@@ -751,8 +780,118 @@ def calibrate_from_actuals(actuals, baseline_rows):
             out[f"{pt}_se"] = se
     return out
 
+# ── Waist-driven partitioning calibration ────────────────────────────────────
+WAIST_FAT_LBS_PER_INCH = 4.0    # population prior (≈ Navy-formula derivative at
+                                # typical proportions: ~2.5 BF-points/inch).
+                                # Superseded by a PERSONAL slope as soon as two
+                                # weigh-in rows carry both bf and waist.
+WAIST_MIN_POINTS   = 4          # post-transient waist readings needed per phase
+WAIST_MIN_SPAN_WK  = 3.0        # ...spanning at least this many weeks
+WAIST_MIN_WT_SLOPE = 0.08       # lbs/wk — below this, the fraction is 0/0 noise
+WAIST_SHRINK_N     = 8          # shrinkage: blend weight = n/(n+this). Few
+                                # points -> stay near the model default; the
+                                # waist-implied value earns influence with data.
+MFRAC_CLAMP_BULK   = (0.15, 0.75)
+MFRAC_CLAMP_CUT    = (0.00, 0.55)
+
+def _personal_fat_per_inch(actuals):
+    """If >=2 rows carry BOTH bf and waist, compute a personal fat-lbs-per-
+    waist-inch slope from the outermost pair; else fall back to the prior."""
+    anchors = [(r[3], r[1] * r[2] / 100.0) for r in actuals
+               if len(r) > 3 and r[2] is not None and r[3] is not None]
+    if len(anchors) >= 2:
+        anchors.sort()
+        dw = anchors[-1][0] - anchors[0][0]
+        if abs(dw) >= 0.5:
+            k = (anchors[-1][1] - anchors[0][1]) / dw
+            return max(1.5, min(8.0, k)), "personal"
+    return WAIST_FAT_LBS_PER_INCH, "default"
+
+def waist_partition_estimate(actuals, baseline_rows, default_bulk, default_cut):
+    """Estimate the muscle fraction of weight change from the waist trend.
+
+    Method: within post-transient, same-phase runs of weigh-ins that include a
+    waist reading, fit OLS slopes of waist and weight over time. Fat change
+    rate = k * waist_slope (k personal if two DEXA+waist anchors exist, else a
+    population prior). Implied muscle fraction = 1 - fat_rate / weight_rate —
+    the same formula covers bulks and cuts (ratio of two negatives on a cut).
+
+    Guardrails: minimum points and time span per phase, a minimum weight slope
+    (otherwise the fraction is a ratio of noise), hard clamps on the result,
+    and SHRINKAGE toward the model default so sparse data can only nudge, not
+    yank. Returns per-channel dicts with implied/applied/n/k for transparency.
+    """
+    out = {"bulk": None, "cut": None,
+           "k": None, "k_source": None}
+    if not actuals or not baseline_rows:
+        return out
+    k, k_src = _personal_fat_per_inch(actuals)
+    out["k"], out["k_source"] = k, k_src
+
+    transient = _transient_weeks(baseline_rows)
+    matched = []   # (date, weight, waist, phase_type)
+    for r in actuals:
+        if len(r) < 4 or r[3] is None:
+            continue
+        d, w, waist = r[0], r[1], r[3]
+        nearest = min(baseline_rows, key=lambda b: abs((b["date"] - d).days))
+        if abs((nearest["date"] - d).days) > 10 or nearest["week"] in transient:
+            continue
+        if nearest["phase_type"] in ("bulk", "cut"):
+            matched.append((d, w, waist, nearest["phase_type"]))
+
+    runs = []
+    cur = []
+    for m in matched:
+        if cur and (m[3] != cur[-1][3] or (m[0] - cur[-1][0]).days > 21):
+            runs.append(cur); cur = []
+        cur.append(m)
+    if cur:
+        runs.append(cur)
+
+    def _slope(pairs):
+        n = len(pairs)
+        xb = sum(x for x, _ in pairs) / n
+        yb = sum(y for _, y in pairs) / n
+        sxx = sum((x - xb) ** 2 for x, _ in pairs)
+        if sxx < 1e-9:
+            return None
+        return sum((x - xb) * (y - yb) for x, y in pairs) / sxx
+
+    per_phase = {"bulk": [], "cut": []}   # (implied_frac, n)
+    for run in runs:
+        n = len(run)
+        if n < WAIST_MIN_POINTS:
+            continue
+        t0 = run[0][0]
+        xs = [ (m[0] - t0).days / 7.0 for m in run ]
+        if xs[-1] - xs[0] < WAIST_MIN_SPAN_WK:
+            continue
+        wt_slope = _slope(list(zip(xs, [m[1] for m in run])))
+        wa_slope = _slope(list(zip(xs, [m[2] for m in run])))
+        if wt_slope is None or wa_slope is None or abs(wt_slope) < WAIST_MIN_WT_SLOPE:
+            continue
+        frac = 1.0 - (k * wa_slope) / wt_slope
+        per_phase[run[0][3]].append((frac, n))
+
+    for pt, default, clamp in (("bulk", default_bulk, MFRAC_CLAMP_BULK),
+                               ("cut",  default_cut,  MFRAC_CLAMP_CUT)):
+        if not per_phase[pt]:
+            continue
+        n_tot = sum(n for _, n in per_phase[pt])
+        implied = sum(f * n for f, n in per_phase[pt]) / n_tot
+        implied = max(clamp[0], min(clamp[1], implied))
+        lam = n_tot / (n_tot + WAIST_SHRINK_N)
+        applied = lam * implied + (1 - lam) * default
+        out[pt] = {"implied": round(implied, 3), "applied": round(applied, 3),
+                   "n": n_tot, "blend": round(lam, 2)}
+    return out
+
+
 def _parse_actuals_df(df):
-    """DataFrame (date, weight) -> clean sorted list of (date, float) tuples."""
+    """DataFrame (date, weight[, bf]) -> sorted list of (date, weight, bf|None).
+    bf is optional ground truth for measurement days (e.g. DEXA); anything
+    outside a sane 3-60% range is treated as not-logged."""
     if df is None or df.empty:
         return []
     out = []
@@ -765,8 +904,18 @@ def _parse_actuals_df(df):
             w = float(w)
         except (TypeError, ValueError):
             continue
+        b = row.get("bf")
+        try:
+            b = float(b) if b is not None and not pd.isna(b) and 3 <= float(b) <= 60 else None
+        except (TypeError, ValueError):
+            b = None
+        wa = row.get("waist_in")
+        try:
+            wa = float(wa) if wa is not None and not pd.isna(wa) and 15 <= float(wa) <= 80 else None
+        except (TypeError, ValueError):
+            wa = None
         if 50 <= w <= 500:
-            out.append((d, w))
+            out.append((d, w, b, wa))
     out.sort(key=lambda t: t[0])
     return out
 
@@ -933,12 +1082,16 @@ with st.sidebar:
             saved = recomp_db.load_weigh_ins(ENGINE)
             if saved:
                 st.session_state.actuals_df = pd.DataFrame(
-                    {"date": pd.to_datetime([d for d, _ in saved]),
-                     "weight": [w for _, w in saved]})
+                    {"date": pd.to_datetime([r[0] for r in saved]),
+                     "weight": [r[1] for r in saved],
+                     "bf": [r[2] for r in saved],
+                     "waist_in": [r[3] for r in saved]})
             else:
                 st.session_state.actuals_df = pd.DataFrame(
                     {"date": pd.Series(dtype="datetime64[ns]"),
-                     "weight": pd.Series(dtype="float")})
+                     "weight": pd.Series(dtype="float"),
+                     "bf": pd.Series(dtype="float"),
+                     "waist_in": pd.Series(dtype="float")})
 
         # ── quick add: the daily path. st.form batches inputs so nothing
         # reruns until submit — no lag, no half-entered rows getting eaten.
@@ -954,6 +1107,15 @@ with st.sidebar:
                 if not _hist.empty and _hist["weight"].notna().any() else 150.0)
         if "wi_date" not in st.session_state:
             st.session_state.wi_date = date.today()
+        # BF resets to 0 after each save (unlike weight, yesterday's BF reading
+        # should never silently carry into today's row). Keyed-widget state
+        # can't be changed after instantiation, so the reset happens here,
+        # before the widget exists, via a flag set at save time.
+        if "wi_bf" not in st.session_state or st.session_state.pop("_clear_bf", False):
+            st.session_state.wi_bf = 0.0
+            st.session_state.wi_waist = 0.0
+        if "_wi_msg" in st.session_state:
+            st.success(st.session_state.pop("_wi_msg"))
         with st.form("add_weighin", clear_on_submit=False, border=False):
             fc1, fc2 = st.columns(2)
             with fc1:
@@ -962,6 +1124,13 @@ with st.sidebar:
                 wi_wt = st.number_input("Weight (lbs)", 50.0, 500.0,
                                         step=0.1, format="%.1f",
                                         key="wi_weight")
+            wi_bf = st.number_input("Body fat % (optional — DEXA/measurement "
+                                    "days only, 0 = skip)", 0.0, 60.0,
+                                    step=0.1, format="%.1f", key="wi_bf")
+            wi_waist = st.number_input("Waist (inches, optional — same "
+                                       "conditions each time: morning, fasted, "
+                                       "at navel. 0 = skip)", 0.0, 80.0,
+                                       step=0.1, format="%.1f", key="wi_waist")
             wi_submit = st.form_submit_button("➕ Add & save", type="primary")
         if wi_submit:
             df = st.session_state.actuals_df.copy()
@@ -969,11 +1138,18 @@ with st.sidebar:
                 # same-date entry replaces (one weigh-in per day)
                 df = df[pd.to_datetime(df["date"], errors="coerce").dt.date != wi_date]
             df = pd.concat([df, pd.DataFrame({"date": [pd.Timestamp(wi_date)],
-                                              "weight": [wi_wt]})],
+                                              "weight": [wi_wt],
+                                              "bf": [wi_bf if wi_bf >= 3 else None],
+                                              "waist_in": [wi_waist if wi_waist >= 15 else None]})],
                            ignore_index=True).sort_values("date")
             st.session_state.actuals_df = df
             recomp_db.save_weigh_ins(ENGINE, _parse_actuals_df(df))
-            st.success(f"Saved: {wi_date} — {wi_wt:.1f} lbs")
+            st.session_state["_wi_msg"] = (
+                f"Saved: {wi_date} — {wi_wt:.1f} lbs"
+                + (f" @ {wi_bf:.1f}% BF" if wi_bf >= 3 else "")
+                + (f", waist {wi_waist:.1f}\"" if wi_waist >= 15 else ""))
+            st.session_state["_clear_bf"] = True
+            st.rerun()
 
         n_log = len(_parse_actuals_df(st.session_state.actuals_df))
         st.caption(f"{n_log} weigh-in{'s' if n_log != 1 else ''} logged.")
@@ -988,10 +1164,21 @@ with st.sidebar:
                     raw = pd.read_csv(up)
                     raw.columns = [c.strip().lower() for c in raw.columns]
                     if "date" in raw.columns and "weight" in raw.columns:
-                        imp = raw[["date", "weight"]].copy()
+                        cols = (["date", "weight"]
+                                + (["bf"] if "bf" in raw.columns else [])
+                                + (["waist_in"] if "waist_in" in raw.columns else []))
+                        imp = raw[cols].copy()
                         imp["date"] = pd.to_datetime(imp["date"], errors="coerce")
                         imp["weight"] = pd.to_numeric(imp["weight"], errors="coerce")
-                        imp = imp.dropna().sort_values("date")
+                        if "bf" in imp.columns:
+                            imp["bf"] = pd.to_numeric(imp["bf"], errors="coerce")
+                        else:
+                            imp["bf"] = None
+                        if "waist_in" in imp.columns:
+                            imp["waist_in"] = pd.to_numeric(imp["waist_in"], errors="coerce")
+                        else:
+                            imp["waist_in"] = None
+                        imp = imp.dropna(subset=["date", "weight"]).sort_values("date")
                         st.session_state.actuals_df = imp
                         st.session_state.actuals_csv_name = up.name
                         recomp_db.save_weigh_ins(ENGINE, _parse_actuals_df(imp),
@@ -1010,12 +1197,20 @@ with st.sidebar:
                     "weight": st.column_config.NumberColumn(
                         "Weight (lbs)", min_value=50.0, max_value=500.0,
                         step=0.1, format="%.1f"),
+                    "bf": st.column_config.NumberColumn(
+                        "BF % (optional)", min_value=0.0, max_value=60.0,
+                        step=0.1, format="%.1f"),
+                    "waist_in": st.column_config.NumberColumn(
+                        "Waist in (optional)", min_value=0.0, max_value=80.0,
+                        step=0.1, format="%.1f"),
                 })
             # Coerce dtypes EVERY run: a blank row flips columns to 'object',
             # which crashes data_editor's type check on the next rerun.
             edited_actuals = pd.DataFrame({
                 "date": pd.to_datetime(edited_actuals.get("date"), errors="coerce"),
                 "weight": pd.to_numeric(edited_actuals.get("weight"), errors="coerce"),
+                "bf": pd.to_numeric(edited_actuals.get("bf"), errors="coerce"),
+                "waist_in": pd.to_numeric(edited_actuals.get("waist_in"), errors="coerce"),
             })
             st.session_state.actuals_df = edited_actuals
             if st.button("💾 Save edits"):
@@ -1025,11 +1220,22 @@ with st.sidebar:
             if n_log:
                 csv_buf = io.StringIO()
                 pd.DataFrame(_parse_actuals_df(st.session_state.actuals_df),
-                             columns=["date", "weight"]).to_csv(csv_buf, index=False)
+                             columns=["date", "weight", "bf", "waist_in"]).to_csv(csv_buf, index=False)
                 st.download_button("⬇️ Download backup CSV", csv_buf.getvalue(),
                                    "weigh_ins.csv", "text/csv")
 
         actuals = _parse_actuals_df(st.session_state.actuals_df)
+        auto_partition = st.checkbox(
+            "Auto-adjust muscle % from waist trend", value=False,
+            help="Uses your weekly waist measurements to estimate how much of "
+                 "your weight change is muscle vs fat, and feeds that into the "
+                 "plan automatically. Conservative by design: it needs several "
+                 "weeks of waist data before it does anything, early weeks "
+                 "after diet changes are ignored, and with little data it "
+                 "stays close to the model's default. A manual 'Muscle %' "
+                 "override always takes priority. Gets more accurate once two "
+                 "logged rows have both a body-fat and waist entry (it then "
+                 "learns YOUR fat-per-inch relationship).")
         apply_calibration = st.checkbox(
             "Apply personal calibration", value=False,
             help="Adjusts the plan to how YOUR body has actually been "
@@ -1042,6 +1248,7 @@ overrides = {
     "bulk_muscle": bulk_muscle_override,
     "cut_muscle":  cut_muscle_override,
 }
+overrides_manual = dict(overrides)   # frozen copy: the calibration reference
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCHEDULE + BAND (cached)
@@ -1094,18 +1301,36 @@ def cached_envelope(sw, sbf, phases_key, frame_tuple, ov_tuple, mods_tuple,
 
 frame_tuple = (frame["height_in"], frame["ceiling_lean"], frame["baseline_lean"],
                frame["ffmi_ceiling"], frame["rate_mult"], frame["allow_recomp"])
-ov_tuple = (bulk_rate_override, cut_rate_override, bulk_muscle_override, cut_muscle_override)
+ov_tuple_manual = (overrides_manual["bulk_rate"], overrides_manual["cut_rate"],
+                   overrides_manual["bulk_muscle"], overrides_manual["cut_muscle"])
 
 # ── Baseline (uncalibrated, 100%-consistency) projection: the fixed reference
 # that personal calibration measures against ──────────────────────────────────
 baseline_phases = cached_schedule(start_weight, start_bf, goal_weight, goal_bf,
-                                  bf_ceiling, bf_floor, frame_tuple, ov_tuple,
+                                  bf_ceiling, bf_floor, frame_tuple, ov_tuple_manual,
                                   max_weeks, max_phase_weeks, (1.0, 1.0), prior_peak)
 baseline_rows = simulate_dynamic(start_weight, start_bf, baseline_phases, frame,
-                                 start_date, overrides, mods=DEFAULT_MODS,
+                                 start_date, overrides_manual, mods=DEFAULT_MODS,
                                  prior_peak=prior_peak)
 
 calib = calibrate_from_actuals(actuals, baseline_rows)
+
+# ── Waist-driven partitioning: estimate from data, inject into the SAME input
+# the manual override uses. Baseline reference above stays raw on purpose —
+# calibration systems must never be fit against their own output. ─────────────
+waist_est = waist_partition_estimate(actuals, baseline_rows,
+                                     dp_start["muscle_frac_bulk"],
+                                     dp_start["muscle_frac_cut"])
+if auto_partition:
+    if overrides["bulk_muscle"] == 0 and waist_est["bulk"]:
+        overrides["bulk_muscle"] = round(waist_est["bulk"]["applied"] * 100, 1)
+    if overrides["cut_muscle"] == 0 and waist_est["cut"]:
+        overrides["cut_muscle"] = round(waist_est["cut"]["applied"] * 100, 1)
+
+# Effective overrides tuple — everything downstream (schedule, timeline CI,
+# envelope) keys its cache on this, so waist-injected values propagate.
+ov_tuple = (overrides["bulk_rate"], overrides["cut_rate"],
+            overrides["bulk_muscle"], overrides["cut_muscle"])
 
 # ── Assemble effective modifiers: consistency x personal calibration ──────────
 a = consistency / 100.0
@@ -1302,6 +1527,27 @@ if actuals:
               else ("×%.2f" % calib['cut_mult'] if cut_ready else "—"),
               f"{calib['cut_n']}/{CALIB_MIN_SAMPLES} samples" if not cut_ready
               else f"{calib['cut_n']} samples")
+    if auto_partition:
+        parts = []
+        for pt, label in (("bulk", "bulk"), ("cut", "cut")):
+            e = waist_est[pt]
+            if e:
+                parts.append(f"{label}: waist trend implies {e['implied']*100:.0f}% "
+                             f"muscle, applying {e['applied']*100:.0f}% "
+                             f"({e['n']} readings)")
+        if parts:
+            k_note = ("your personal fat-per-inch relationship"
+                      if waist_est["k_source"] == "personal"
+                      else "a population estimate — log body fat + waist on "
+                           "your next DEXA day and it becomes personal")
+        if parts:
+            st.info("📏 **Waist-based muscle/fat split is active** — "
+                    + "; ".join(parts) + f". Conversion uses {k_note}.")
+        else:
+            st.caption("📏 Waist auto-adjust is on, but there isn't enough "
+                       "steady-state waist data yet — it needs several "
+                       "readings within one phase, past the first weeks after "
+                       "a diet change. Keep taping weekly.")
     if apply_calibration and (bulk_ready or cut_ready):
         parts = []
         if bulk_ready and calib["bulk_se"] is not None:
@@ -1412,7 +1658,7 @@ fig.add_trace(go.Scatter(x=dates, y=leans, mode="lines", name="Lean Mass",
     hovertemplate="<b>%{text}</b><br>Lean: %{y} lbs<extra></extra>", text=plist), row=1, col=1)
 if actuals:
     fig.add_trace(go.Scatter(
-        x=[d for d, _ in actuals], y=[w for _, w in actuals],
+        x=[r[0] for r in actuals], y=[r[1] for r in actuals],
         mode="markers", name="Actual Weigh-ins",
         marker=dict(symbol="diamond", size=7, color="#f8fafc",
                     line=dict(color="#0ea5e9", width=1.5)),
