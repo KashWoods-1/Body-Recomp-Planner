@@ -28,6 +28,8 @@ weigh_ins = Table(
     Column("id", Integer, primary_key=True),
     Column("date", Date, nullable=False, unique=True),
     Column("weight_lbs", Float, nullable=False),
+    Column("bf", Float, nullable=True),        # optional: DEXA/measurement days
+    Column("waist_in", Float, nullable=True),  # optional: weekly tape measurement
     Column("source", Text, nullable=False, server_default="app"),
 )
 
@@ -99,8 +101,17 @@ def get_engine(url):
 
 
 def init_db(engine):
-    """Create any missing tables. Safe to call on every app start."""
+    """Create any missing tables, and apply tiny in-place migrations for
+    columns added after a table already exists (create_all never alters
+    existing tables). Safe to call on every app start."""
     metadata.create_all(engine)
+    from sqlalchemy import inspect
+    cols = {c["name"] for c in inspect(engine).get_columns("weigh_ins")}
+    with engine.begin() as con:
+        if "bf" not in cols:
+            con.execute(text("ALTER TABLE weigh_ins ADD COLUMN bf REAL"))
+        if "waist_in" not in cols:
+            con.execute(text("ALTER TABLE weigh_ins ADD COLUMN waist_in REAL"))
 
 
 def backend_name(engine):
@@ -115,7 +126,7 @@ def load_weigh_ins(engine):
     with engine.connect() as con:
         rows = con.execute(
             weigh_ins.select().order_by(weigh_ins.c.date)).fetchall()
-    return [(r.date, r.weight_lbs) for r in rows]
+    return [(r.date, r.weight_lbs, r.bf, r.waist_in) for r in rows]
 
 
 def save_weigh_ins(engine, entries, source="app"):
@@ -123,12 +134,18 @@ def save_weigh_ins(engine, entries, source="app"):
     transaction — deletions in the app editor propagate here."""
     init_db(engine)
     payload = []
-    for d, w in entries:
+    for row in entries:
+        d, w = row[0], row[1]
+        bf = row[2] if len(row) > 2 else None
+        waist = row[3] if len(row) > 3 else None
         if isinstance(d, str):
             d = date_type.fromisoformat(d[:10])
         elif hasattr(d, "date") and not isinstance(d, date_type):
             d = d.date()   # pandas Timestamp / datetime -> date
-        payload.append({"date": d, "weight_lbs": float(w), "source": source})
+        payload.append({"date": d, "weight_lbs": float(w),
+                        "bf": (float(bf) if bf is not None else None),
+                        "waist_in": (float(waist) if waist is not None else None),
+                        "source": source})
     with engine.begin() as con:
         con.execute(weigh_ins.delete())
         if payload:
